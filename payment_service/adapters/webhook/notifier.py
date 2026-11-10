@@ -71,17 +71,24 @@ class WebhookNotifier(interfaces.WebhookNotifier):
             payment: Обработанный платёж.
 
         Raises:
+            WebhookAddressInvalid: Клиент не может построить запрос по адресу (битый хост).
             WebhookRejected: Получатель ответил 4xx (кроме 408 и 429).
             WebhookUnavailable: Получатель недоступен или ответил не 2xx и не 4xx.
         """
         url = payment.webhook_url
+        body = WebhookMessage.from_application(payment).body()
+        try:
+            request = self._client.build_request(
+                "POST",
+                url,
+                content=body,
+                headers={"Content-Type": CONTENT_TYPE, PAYMENT_ID_HEADER: str(payment.id)},
+            )
+        except (httpx.InvalidURL, UnicodeError) as exc:
+            raise errors.WebhookAddressInvalid(url=url) from exc
         try:
             async with asyncio.timeout(self._timeout):
-                response = await self._client.post(
-                    url,
-                    content=WebhookMessage.from_application(payment).body(),
-                    headers={"Content-Type": CONTENT_TYPE, PAYMENT_ID_HEADER: str(payment.id)},
-                )
+                response = await self._client.send(request)
         except (httpx.HTTPError, TimeoutError) as exc:
             raise errors.WebhookUnavailable(url=url) from exc
         status = response.status_code

@@ -9,6 +9,7 @@ import json
 from decimal import Decimal
 from typing import Annotated
 
+import idna
 from pydantic import AfterValidator, AnyUrl, Field, JsonValue, UrlConstraints
 from pydantic_core import PydanticCustomError
 
@@ -21,9 +22,29 @@ MAX_METADATA_BYTES = 4096  # сериализованный JSON метадан�
 # для БД, но один для человека.
 IDEMPOTENCY_KEY_PATTERN = r"^\S(.*\S)?$"
 
+
+def _without_nul(value: str) -> str:
+    r"""Отклоняет строку с символом ``\u0000``: PostgreSQL не хранит его в текстовых колонках.
+
+    Args:
+        value: Строка после проверки длины.
+
+    Returns:
+        Та же строка.
+
+    Raises:
+        PydanticCustomError: В строке есть ``\u0000`` (тип ``string_not_storable``).
+    """
+    if "\x00" in value:
+        raise PydanticCustomError(
+            "string_not_storable", "Строка содержит недопустимый символ \\u0000"
+        )
+    return value
+
+
 # Сумма платежа: Numeric(18, 2) в хранилище, строго положительная, без NaN и бесконечностей.
 Amount = Annotated[Decimal, Field(gt=0, max_digits=18, decimal_places=2, allow_inf_nan=False)]
-Description = Annotated[str, Field(max_length=MAX_DESCRIPTION_LENGTH)]
+Description = Annotated[str, Field(max_length=MAX_DESCRIPTION_LENGTH), AfterValidator(_without_nul)]
 IdempotencyKey = Annotated[
     str,
     Field(min_length=1, max_length=MAX_IDEMPOTENCY_KEY_LENGTH, pattern=IDEMPOTENCY_KEY_PATTERN),
@@ -50,13 +71,69 @@ def _without_userinfo(url: AnyUrl) -> AnyUrl:
     return url
 
 
-# Адрес webhook: только http/https с хостом, без учётных данных, не длиннее колонки хранилища.
+def _fits_storage(url: AnyUrl) -> AnyUrl:
+    """Отклоняет URL, который после нормализации длиннее колонки хранилища.
+
+    ``UrlConstraints.max_length`` меряет вход, а хранится ``str(url)``: percent-encoding
+    кириллицы в пути утраивает длину (1009 символов на входе — 6009 в хранилище).
+
+    Args:
+        url: Разобранный и нормализованный URL.
+
+    Returns:
+        Тот же URL.
+
+    Raises:
+        PydanticCustomError: Нормализованный URL длиннее ``MAX_WEBHOOK_URL_LENGTH``
+            (тип ``url_too_long``).
+    """
+    if len(str(url)) > MAX_WEBHOOK_URL_LENGTH:
+        raise PydanticCustomError(
+            "url_too_long",
+            "URL после нормализации длиннее {max_length} символов",
+            {"max_length": MAX_WEBHOOK_URL_LENGTH},
+        )
+    return url
+
+
+def _decodable_host(url: AnyUrl) -> AnyUrl:
+    """Отклоняет хост в punycode (``xn--…``), который не раскодируется по IDNA 2008.
+
+    Инвариант адреса уведомления: хост в punycode — корректная A-метка IDNA 2008, иначе
+    платёж принят, а уведомить некуда. Pydantic отдаёт хост уже в ASCII и A-метки не
+    проверяет. Прочие ASCII-хосты (``_`` в имени сервиса, IP-адреса, ``localhost``) не
+    проверяются; совпадение правила с HTTP-клиентом держит тест шва webhook-адаптера.
+
+    Args:
+        url: Разобранный URL.
+
+    Returns:
+        Тот же URL.
+
+    Raises:
+        PydanticCustomError: Хост не раскодируется (тип ``webhook_url_host``).
+    """
+    host = url.host or ""
+    if host.startswith("xn--"):
+        try:
+            idna.decode(host)
+        except idna.IDNAError as exc:
+            raise PydanticCustomError(
+                "webhook_url_host", "Хост URL webhook — недопустимый punycode"
+            ) from exc
+    return url
+
+
+# Адрес webhook: только http/https с хостом, без учётных данных, с раскодируемым хостом, не
+# длиннее колонки хранилища ни на входе, ни после нормализации.
 WebhookUrl = Annotated[
     AnyUrl,
     UrlConstraints(
         max_length=MAX_WEBHOOK_URL_LENGTH, allowed_schemes=["http", "https"], host_required=True
     ),
     AfterValidator(_without_userinfo),
+    AfterValidator(_decodable_host),
+    AfterValidator(_fits_storage),
 ]
 
 

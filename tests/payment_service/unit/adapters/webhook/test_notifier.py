@@ -7,6 +7,7 @@ from uuid import UUID
 
 import httpx
 import pytest
+from pydantic import TypeAdapter
 
 from payment_service.adapters import retry, webhook
 from payment_service.application import dtos, entities, errors, interfaces
@@ -96,6 +97,38 @@ class TestNotify:
             await _notifier(httpx.MockTransport(handler)).notify(PAYMENT)
         assert isinstance(excinfo.value.__cause__, httpx.ConnectError)
 
+    @pytest.mark.parametrize(
+        ("url", "cause"),
+        [("http://xn--zz-xyz/hook", UnicodeError), ("http://[zz]/hook", httpx.InvalidURL)],
+        ids=["bad_punycode", "bad_ip_literal"],
+    )
+    async def test__unbuildable_address_is_invalid_without_request(
+        self, url: str, cause: type[Exception]
+    ) -> None:
+        # Setup: адрес, сохранённый до проверки на входе, — httpx не строит по нему запрос
+        requests: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request)
+            return httpx.Response(200)
+
+        payment = PAYMENT.model_copy(update={"webhook_url": url})
+
+        # Call and Assert: правило (DLQ), а не необработанное исключение (остановка консьюмера)
+        with pytest.raises(errors.WebhookAddressInvalid) as excinfo:
+            await _notifier(httpx.MockTransport(handler)).notify(payment)
+        assert isinstance(excinfo.value.__cause__, cause)
+        assert requests == []
+
+    async def test__unserializable_body_is_defect_not_address(self) -> None:
+        # Setup: дефект проводной модели — не свойство адреса
+        payment = PAYMENT.model_copy(update={"metadata": {"bad": object()}})
+
+        # Call and Assert: исключение не ядра — политика остановит консьюмер, а не DLQ
+        with pytest.raises(ValueError) as excinfo:
+            await _notifier().notify(payment)
+        assert not isinstance(excinfo.value, errors.Error)
+
     async def test__slow_receiver_hits_deadline(self) -> None:
         # Setup: получатель отвечает дольше WEBHOOK_TIMEOUT = 0.2 с
         async def handler(request: httpx.Request) -> httpx.Response:
@@ -164,6 +197,17 @@ class TestRetryingWebhookNotifier:
         # Assert
         assert inner.notify.await_count == 2
 
+    async def test__invalid_address_is_not_retried(self) -> None:
+        # Setup
+        inner = Mock(interfaces.WebhookNotifier)
+        inner.notify.side_effect = errors.WebhookAddressInvalid(url="u")
+        notifier = webhook.RetryingWebhookNotifier(inner, retry.Retry(attempts=3, backoff=0))
+
+        # Call and Assert
+        with pytest.raises(errors.WebhookAddressInvalid):
+            await notifier.notify(PAYMENT)
+        assert inner.notify.await_count == 1
+
     async def test__rejection_is_not_retried(self) -> None:
         # Setup
         inner = Mock(interfaces.WebhookNotifier)
@@ -174,6 +218,32 @@ class TestRetryingWebhookNotifier:
         with pytest.raises(errors.WebhookRejected):
             await notifier.notify(PAYMENT)
         assert inner.notify.await_count == 1
+
+
+class TestAcceptedAddressIsBuildable:
+    """Шов ядро ↔ адаптер: адрес, принятый ``dtos.WebhookUrl``, httpx строит в запрос."""
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "http://webhook_sink:8080/payments",
+            "http://[::1]:8080/x",
+            "http://localhost/x",
+            "http://127.0.0.1/x",
+            "http://" + "a" * 64 + ".example/x",
+            "HTTP://EXAMPLE.COM/X",
+            "http://example.com./x",
+            "http://sub.xn--zz-xyz/x",
+            "http://домен.рф/путь",
+            "https://h/" + "д" * 300,
+        ],
+    )
+    def test__built_by_client(self, url: str) -> None:
+        # Setup
+        accepted = TypeAdapter(dtos.WebhookUrl).validate_python(url)
+
+        # Call and Assert: построение запроса не падает
+        httpx.Request("POST", str(accepted))
 
 
 class TestSettings:

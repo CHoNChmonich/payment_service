@@ -122,6 +122,15 @@ class WebhookRejected(RuleViolationError):
     message_template = "Получатель webhook {url} отверг уведомление: HTTP {status_code}"
 
 
+class WebhookAddressInvalid(RuleViolationError):
+    """Адрес webhook непригоден для доставки: HTTP-клиент не может построить запрос.
+
+    Повтор даст тот же отказ; адрес, принятый до ужесточения проверки на входе, — тоже сюда.
+    """
+
+    message_template = "Адрес webhook {url} непригоден для доставки"
+
+
 class PaymentNotFound(NotFoundError):
     """Платёж с указанным ``id`` отсутствует."""
 

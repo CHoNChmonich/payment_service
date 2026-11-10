@@ -35,6 +35,10 @@ class TestPaymentCreateBody:
             {**BASE, "metadata": {"k": "ы" * 2000}},
             {**BASE, "webhook_url": "https://h/" + "p" * (dtos.MAX_WEBHOOK_URL_LENGTH - 10)},
             {**BASE, "currency": "EUR"},
+            # Хосты, которые не A-метки, IDNA не проверяет — как и HTTP-клиент
+            {**BASE, "webhook_url": "http://webhook_sink:8080/payments"},
+            {**BASE, "webhook_url": "http://[::1]:8080/x"},
+            {**BASE, "webhook_url": "http://sub.xn--zz-xyz/x"},
         ],
     )
     def test__edge_inputs_are_accepted_by_core(self, payload: dict[str, Any]) -> None:
@@ -56,7 +60,12 @@ class TestPaymentCreateBody:
             ("metadata", {"k": "ы" * 5000}),
             ("metadata", {"k": "a\x00b"}),
             ("webhook_url", "https://h/" + "p" * dtos.MAX_WEBHOOK_URL_LENGTH),
+            ("description", "a\x00b"),
             ("webhook_url", "http://u@h/x"),
+            # Битый punycode: HTTP-клиент не раскодирует хост — уведомить было бы некуда
+            ("webhook_url", "http://xn--zz-xyz/x"),
+            # Вход 1009 символов, после percent-encoding — 6009: колонка не вместит
+            ("webhook_url", "http://h/" + "д" * 1000),
             ("currency", "GBP"),
         ],
     )
