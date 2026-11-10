@@ -241,12 +241,6 @@ docker compose --profile tests up -d db_for_tests rabbitmq
 docker compose --profile tests run --rm --build tests
 ```
 
-e2e на поднятом стенде (~3 мин; пишет в БД стенда, чистит DLQ, перезапускает consumer):
-
-```bash
-bash scripts/e2e.sh            # или --no-build
-```
-
 Миграции: `uv run python -m payment_service.launchers.alembic_runner upgrade head`
 (`alembic.ini` нет — конфиг собирается из настроек); новая —
 `... revision --autogenerate -m "<slug>" --rev-id 0002`.
@@ -271,7 +265,6 @@ payment_service/
   launchers/              composition roots: api, relay, consumer; process (сигналы, heartbeat)
 tests/payment_service/    unit/ (без инфраструктуры), integration/ (api, database, rabbitmq)
 deployment/entrypoints/   скрипты запуска контейнеров
-scripts/e2e.sh            e2e на стенде
 ```
 
 Зависимости направлены внутрь (`launchers → adapters → application`) и проверяются

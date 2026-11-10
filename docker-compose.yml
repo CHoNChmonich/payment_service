@@ -110,7 +110,7 @@ services:
   # Консьюмер новых платежей. lock_timeout — чтобы ожидание блокировки укладывалось в дедлайн
   # попытки (связки проверяет launchers/consumer.py при старте). stop_grace_period — не меньше
   # new_payments.Settings.stop_grace (по умолчанию 110 с): дорабатывающий платёж подтверждается.
-  # PAYMENT_GATEWAY_FAILURE_RATE берётся из окружения shell (e2e переключает 0.1 → 1).
+  # PAYMENT_GATEWAY_FAILURE_RATE берётся из окружения shell (например, 1 — чтобы увидеть failed и повторы).
   consumer:
     <<: *app
     depends_on:
