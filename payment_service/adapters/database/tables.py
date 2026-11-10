@@ -84,3 +84,14 @@ outbox = Table(
     Column("payload", JSONB, nullable=False),
     Column("created_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
 )
+
+# Inbox: обработанные входящие сообщения; первичный ключ — ключ идемпотентности источника
+# (``event_id`` события), ``fingerprint`` отличает повтор того же сообщения от другого с тем же
+# ключом. Строка вставляется в транзакции эффекта сообщения и исчезает вместе с ним при откате.
+inbox = Table(
+    "inbox",
+    metadata,
+    Column("message_id", Uuid, primary_key=True),
+    Column("fingerprint", String(80), nullable=False),
+    Column("received_at", DateTime(timezone=True), nullable=False, server_default=func.now()),
+)

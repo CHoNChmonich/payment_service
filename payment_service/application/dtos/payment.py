@@ -1,4 +1,4 @@
-"""DTO платежа: вход сценария создания и выход всех сценариев."""
+"""DTO платежа: вход сценариев создания и обработки сообщений, выход сценариев."""
 
 from datetime import datetime
 from decimal import Decimal
@@ -16,7 +16,7 @@ class NewPaymentInfo(BaseModel):
     """Данные для создания платежа.
 
     Attributes:
-        idempotency_key: Ключ идемпотентности запроса из заголовка ``Idempotency-Key``.
+        idempotency_key: Ключ идемпотентности запроса на создание.
         amount: Сумма платежа.
         currency: Валюта платежа.
         description: Назначение платежа; может быть пустым.
@@ -30,6 +30,20 @@ class NewPaymentInfo(BaseModel):
     description: Description = ""
     metadata: Metadata = Field(default_factory=dict)
     webhook_url: WebhookUrl
+
+
+class PaymentEventInfo(BaseModel):
+    """Событие о платеже, пришедшее входящим сообщением, — вход сценариев ``process`` и ``notify``.
+
+    Attributes:
+        event_id: Идентификатор события — ключ идемпотентности сценария (inbox).
+        payment_id: Платёж, к которому относится событие.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    event_id: UUID
+    payment_id: UUID
 
 
 class PaymentInfo(BaseModel):

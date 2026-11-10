@@ -26,14 +26,15 @@ EVENT = dtos.PaymentCreated(
 class TestPaymentCreatedMessage:
     def test__accepts_published_body(self) -> None:
         # Setup
-        body = payment_events.PaymentCreatedMessage.from_application(EVENT).body()
+        body = payment_events.PaymentEventMessage.from_application(EVENT).body()
 
         # Call
         message = new_payments.PaymentCreatedMessage.model_validate_json(body)
 
         # Assert
-        assert message.to_application() == EVENT.payment_id
-        assert message.event_id == EVENT.event_id
+        assert message.to_application() == dtos.PaymentEventInfo(
+            event_id=EVENT.event_id, payment_id=EVENT.payment_id
+        )
 
     def test__ignores_unknown_fields(self) -> None:
         # Setup
@@ -51,7 +52,7 @@ class TestPaymentCreatedMessage:
 
         # Assert
         assert message.occurred_at is None
-        assert message.to_application() == EVENT.payment_id
+        assert message.to_application().payment_id == EVENT.payment_id
 
     @pytest.mark.parametrize(
         "body",
@@ -66,7 +67,11 @@ class TestPaymentCreatedMessage:
                     "payment_id": str(EVENT.payment_id),
                 }
             ),
+            payment_events.PaymentEventMessage.from_application(
+                dtos.PaymentProcessed(payment_id=EVENT.payment_id)
+            ).body(),
         ],
+        ids=["not_json", "empty", "bad_uuids", "unknown_type", "processed_event"],
     )
     def test__rejects_bad_bodies(self, body: bytes | str) -> None:
         # Call and Assert

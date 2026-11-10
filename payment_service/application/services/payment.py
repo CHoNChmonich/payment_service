@@ -1,5 +1,6 @@
 """Сценарии платежа."""
 
+import hashlib
 from collections.abc import Callable
 from datetime import UTC, datetime
 from uuid import UUID
@@ -7,6 +8,9 @@ from uuid import UUID
 from payment_service.application import dtos, entities, errors, interfaces
 
 type Clock = Callable[[], datetime]
+
+# Версия формата отпечатка inbox: смена набора полей — новая версия, а не ложный конфликт.
+_FINGERPRINT_VERSION = "1"
 
 
 def _utc_now() -> datetime:
@@ -22,10 +26,11 @@ class Payment(interfaces.Payment):
     """Сценарии платежа; каждый публичный метод — отдельная транзакция.
 
     Создание пишет платёж и событие ``PaymentCreated`` в outbox одной транзакцией. Обработка и
-    уведомление держат строку платежа под ``FOR UPDATE`` на время обращения к шлюзу или к
-    получателю webhook: второй экземпляр консьюмера с копией того же сообщения дождётся
-    исхода и увидит финальное состояние, а не проведёт платёж повторно. Контракт методов — у
-    порта ``interfaces.Payment``; здесь — как он исполняется.
+    уведомление вызываются событиями и первой операцией регистрируют событие в inbox: копия
+    того же события в параллельной транзакции ждёт исхода первой и получает «уже обработано».
+    Затем строка платежа блокируется ``FOR UPDATE`` до конца транзакции — на время обращения к
+    шлюзу или к получателю webhook. Контракт методов — у порта ``interfaces.Payment``; здесь —
+    как он исполняется.
 
     Attributes:
         uow_factory: Вызываемый объект, создающий новый Unit of Work на каждый вызов метода.
@@ -109,49 +114,59 @@ class Payment(interfaces.Payment):
                 raise errors.PaymentNotFound(id=payment_id)
             return dtos.PaymentInfo.model_validate(payment)
 
-    async def process(self, payment_id: UUID) -> dtos.PaymentInfo:
-        """Блокирует платёж, обращается к шлюзу под блокировкой и фиксирует результат.
+    async def process(self, event: dtos.PaymentEventInfo) -> bool:
+        """Регистрирует событие в inbox, блокирует платёж, проводит его через шлюз.
 
-        Отказ шлюза (``GatewayUnavailable`` после повторов адаптера) — не сбой сценария, а
-        результат платежа: ``failed``. Уже обработанный платёж возвращается без обращения к
-        шлюзу и без commit.
+        Регистрация идёт первой: повтор события не читает платёж и не обращается к шлюзу.
+        Проверка статуса (``ensure_processable``) — до шлюза: уже обработанный платёж через шлюз
+        не проводится. Отказ шлюза (``GatewayUnavailable`` после повторов адаптера) — не сбой
+        сценария, а результат платежа: ``failed``. Событие ``PaymentProcessed`` — в outbox до
+        commit, под блокировкой строки.
 
         Args:
-            payment_id: Идентификатор платежа.
+            event: Событие о созданном платеже.
 
         Returns:
-            Платёж в финальном статусе.
+            ``True`` — платёж проведён; ``False`` — событие уже обработано.
         """
         async with self.uow_factory() as uow:
-            payment = await _fetch_payment_for_update(uow, payment_id)
-            if payment.is_final:
-                return dtos.PaymentInfo.model_validate(payment)
+            if not await uow.inbox.register(event.event_id, _fingerprint("payment_created", event)):
+                return False
+            payment = await _fetch_payment_for_update(uow, event.payment_id)
+            payment.ensure_processable()
             try:
                 await self.gateway.charge(dtos.PaymentInfo.model_validate(payment))
             except errors.GatewayUnavailable:
-                payment.fail(self._clock())
+                outcome = payment.fail
             else:
-                payment.succeed(self._clock())
+                outcome = payment.succeed
+            now = self._clock()
+            outcome(now)
+            await uow.outbox.add(dtos.PaymentProcessed(payment_id=payment.id, occurred_at=now))
             await uow.commit()
-            return dtos.PaymentInfo.model_validate(payment)
+            return True
 
-    async def notify(self, payment_id: UUID) -> bool:
-        """Блокирует платёж, доставляет уведомление под блокировкой и отмечает доставку.
+    async def notify(self, event: dtos.PaymentEventInfo) -> bool:
+        """Регистрирует событие в inbox, блокирует платёж, доставляет уведомление и отмечает его.
 
-        Сбой доставки уходит наружу без commit: отметки нет, повтор сообщения доставит снова.
+        Проверка (``ensure_notifiable``) — до отправки: по платежу в обработке или уже
+        уведомлённому webhook не уходит. Отметка — после подтверждённой доставки, момент
+        доставки. Сбой доставки уходит наружу без commit: ни отметки, ни регистрации события —
+        повтор доставит снова.
 
         Args:
-            payment_id: Идентификатор обработанного платежа.
+            event: Событие о проведённом платеже.
 
         Returns:
-            ``True`` — доставлено этим вызовом; ``False`` — уже было доставлено.
+            ``True`` — доставлено; ``False`` — событие уже обработано.
         """
         async with self.uow_factory() as uow:
-            payment = await _fetch_payment_for_update(uow, payment_id)
-            if not payment.is_final:
-                raise errors.PaymentNotProcessed(id=payment_id)
-            if payment.notified_at is not None:
+            if not await uow.inbox.register(
+                event.event_id, _fingerprint("payment_processed", event)
+            ):
                 return False
+            payment = await _fetch_payment_for_update(uow, event.payment_id)
+            payment.ensure_notifiable()
             await self.notifier.notify(dtos.PaymentInfo.model_validate(payment))
             payment.mark_notified(self._clock())
             await uow.commit()
@@ -179,3 +194,20 @@ async def _fetch_payment_for_update(
     if payment is None:
         raise errors.PaymentNotFound(id=payment_id)
     return payment
+
+
+def _fingerprint(event_type: dtos.PaymentEventType, event: dtos.PaymentEventInfo) -> str:
+    """Отпечаток значимого содержимого события для inbox.
+
+    Тип события входит в отпечаток: одна таблица inbox у двух сценариев, и событие одного
+    типа, попавшее не в тот сценарий, — конфликт, а не молчаливый дубль.
+
+    Args:
+        event_type: Тип события, которое обрабатывает сценарий.
+        event: Событие.
+
+    Returns:
+        Версия формата и SHA-256 типа и ``payment_id``.
+    """
+    digest = hashlib.sha256(f"{event_type}\n{event.payment_id}".encode()).hexdigest()
+    return f"{_FINGERPRINT_VERSION}:{digest}"

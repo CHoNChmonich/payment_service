@@ -1,5 +1,6 @@
-# Стенд: db, rabbitmq, api (миграции → uvicorn), relay (outbox → payments.new), consumer
-# (payments.new → шлюз → webhook, отказы — в DLQ), webhook_sink (эхо-приёмник webhook).
+# Стенд: db, rabbitmq, api (миграции → uvicorn), relay (outbox → payments.new / .processed),
+# consumer (payments.new → шлюз → событие payment_processed), notifier (payments.processed →
+# webhook), отказы — в свои DLQ; webhook_sink (эхо-приёмник webhook).
 # Профиль tests: db_for_tests и прогон интеграционных тестов.
 # Переменные ${...} — из корневого .env (копируется из .env.example); окружение shell важнее.
 name: payment-service
@@ -109,7 +110,8 @@ services:
 
   # Консьюмер новых платежей. lock_timeout — чтобы ожидание блокировки укладывалось в дедлайн
   # попытки (связки проверяет launchers/consumer.py при старте). stop_grace_period — не меньше
-  # new_payments.Settings.stop_grace (по умолчанию 110 с): дорабатывающий платёж подтверждается.
+  # stop_grace консьюмера (NEW_PAYMENTS_HANDLER_TIMEOUT + DLQ + 15 с, по умолчанию 80 с):
+  # дорабатывающий платёж подтверждается.
   # PAYMENT_GATEWAY_FAILURE_RATE берётся из окружения shell (например, 1 — чтобы увидеть failed и повторы).
   consumer:
     <<: *app
@@ -132,7 +134,32 @@ services:
       timeout: 5s
       retries: 3
       start_period: 20s
-    stop_grace_period: 110s
+    stop_grace_period: 80s
+
+  # Консьюмер уведомлений. lock_timeout — под худшее время доставки webhook (связки проверяет
+  # launchers/notifier.py при старте). stop_grace_period — не меньше stop_grace консьюмера
+  # (PROCESSED_PAYMENTS_HANDLER_TIMEOUT + DLQ + 15 с, по умолчанию 80 с).
+  notifier:
+    <<: *app
+    depends_on:
+      api:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    environment:
+      POSTGRES_HOST: db
+      POSTGRES_PORT: "5432"
+      POSTGRES_LOCK_TIMEOUT_MS: "20000"
+      RABBITMQ_URL: amqp://${RABBITMQ_USER:-guest}:${RABBITMQ_PASSWORD:-guest}@rabbitmq:5672/
+      HEARTBEAT_FILE: /tmp/notifier.alive
+    entrypoint: ["entrypoint_notifier.sh"]
+    healthcheck:
+      test: ["CMD", "python", "-m", "payment_service.launchers.process", "--check-heartbeat", "60"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    stop_grace_period: 80s
 
   # Эхо-приёмник webhook: пишет каждый запрос (заголовки и тело) JSON-строкой в лог.
   # Адрес для webhook_url — http://webhook_sink:8080/... (внутри сети compose);

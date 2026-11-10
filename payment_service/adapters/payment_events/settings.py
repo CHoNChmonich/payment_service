@@ -13,8 +13,10 @@ class Settings(BaseSettings):
         RABBITMQ_URL: URL подключения ``amqp://user:password@host:port/vhost``; в логи не
             попадает.
         PAYMENT_EVENTS_EXCHANGE: Обменник событий платежей (direct); публикатор его объявляет.
-        PAYMENT_EVENTS_ROUTING_KEY: Ключ маршрутизации события «платёж создан» — имя очереди
-            консьюмера.
+        PAYMENT_EVENTS_CREATED_ROUTING_KEY: Ключ маршрутизации события «платёж создан» — имя
+            очереди консьюмера новых платежей (``NEW_PAYMENTS_ROUTING_KEY``).
+        PAYMENT_EVENTS_PROCESSED_ROUTING_KEY: Ключ маршрутизации события «платёж проведён» —
+            имя очереди консьюмера уведомлений (``PROCESSED_PAYMENTS_ROUTING_KEY``).
         PAYMENT_EVENTS_PUBLISH_TIMEOUT: Дедлайн подтверждения одной публикации в секундах;
             превышение — временный сбой брокера.
     """
@@ -23,7 +25,8 @@ class Settings(BaseSettings):
 
     RABBITMQ_URL: SecretStr = Field(min_length=1)
     PAYMENT_EVENTS_EXCHANGE: str = Field(default="payments", min_length=1)
-    PAYMENT_EVENTS_ROUTING_KEY: str = Field(default="payments.new", min_length=1)
+    PAYMENT_EVENTS_CREATED_ROUTING_KEY: str = Field(default="payments.new", min_length=1)
+    PAYMENT_EVENTS_PROCESSED_ROUTING_KEY: str = Field(default="payments.processed", min_length=1)
     PAYMENT_EVENTS_PUBLISH_TIMEOUT: float = Field(default=5.0, gt=0, le=60)
 
     @property

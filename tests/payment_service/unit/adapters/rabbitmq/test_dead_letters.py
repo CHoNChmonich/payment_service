@@ -8,23 +8,26 @@ from faststream.rabbit import RabbitExchange
 from pamqp import commands
 from pamqp.header import ContentHeader
 
-from payment_service.adapters import new_payments
+from payment_service.adapters import rabbitmq
 from payment_service.application import errors
 
-from .support import FakeBroker, message, settings
+from .support import FakeBroker, config, error_code, message
 
 # ---------------------------------------------------------------------------------------
 # SETUP
 # ---------------------------------------------------------------------------------------
 BODY = b'{"payment_id": "x"}'
-SETTINGS = settings()
+CONFIG = config()
 
 
 def _dead_letters(
     replies: list[object] | None = None,
-) -> tuple[new_payments.DeadLetters, FakeBroker]:
+) -> tuple[rabbitmq.DeadLetters, FakeBroker]:
     broker = FakeBroker([], asyncio.Event(), [], replies=replies)
-    return new_payments.DeadLetters(SETTINGS, cast(Any, broker)), broker
+    return (
+        rabbitmq.DeadLetters(CONFIG.dead_letter_target, cast(Any, broker), error_code),
+        broker,
+    )
 
 
 def _returned() -> DeliveredMessage:
@@ -77,18 +80,16 @@ class TestPublish:
         assert headers["x-original-routing-key"] == "payments.new"
         assert isinstance(headers["x-failed-at"], str)
 
-    async def test__non_core_error_uses_class_name(self) -> None:
-        # Setup
+    async def test__error_code_comes_from_injected_function(self) -> None:
+        # Setup: код причины считает функция адаптера (здесь — support.error_code)
         dead_letters, broker = _dead_letters()
 
         # Call
-        await dead_letters.publish(
-            message(BODY, []), new_payments.InvalidMessage("не по контракту"), attempts=1
-        )
+        await dead_letters.publish(message(BODY, []), ValueError("не по контракту"), attempts=1)
 
         # Assert
         headers = cast(dict[str, object], broker.published[0]["headers"])
-        assert headers["x-error-code"] == "InvalidMessage"
+        assert headers["x-error-code"] == "ValueError"
         assert headers["x-error"] == "не по контракту"
 
     async def test__connection_loss_is_temporary(self) -> None:
@@ -96,7 +97,7 @@ class TestPublish:
         dead_letters, _ = _dead_letters([ConnectionClosed(320, "CONNECTION_FORCED")])
 
         # Call and Assert
-        with pytest.raises(new_payments.DeadLetterUnavailable):
+        with pytest.raises(rabbitmq.DeadLetterUnavailable):
             await dead_letters.publish(message(BODY, []), RuntimeError("x"), attempts=1)
 
     async def test__returned_message_is_temporary(self) -> None:
@@ -104,7 +105,7 @@ class TestPublish:
         dead_letters, _ = _dead_letters([_returned()])
 
         # Call and Assert
-        with pytest.raises(new_payments.DeadLetterUnavailable, match="возвращено"):
+        with pytest.raises(rabbitmq.DeadLetterUnavailable, match="возвращено"):
             await dead_letters.publish(message(BODY, []), RuntimeError("x"), attempts=1)
 
     async def test__publish_error_on_return_is_temporary(self) -> None:
@@ -113,7 +114,7 @@ class TestPublish:
         dead_letters, _ = _dead_letters([PublishError(returned, returned.delivery)])
 
         # Call and Assert
-        with pytest.raises(new_payments.DeadLetterUnavailable):
+        with pytest.raises(rabbitmq.DeadLetterUnavailable):
             await dead_letters.publish(message(BODY, []), RuntimeError("x"), attempts=1)
 
     async def test__access_refused_is_permanent(self) -> None:
@@ -121,7 +122,7 @@ class TestPublish:
         dead_letters, _ = _dead_letters([ChannelAccessRefused(403, "ACCESS_REFUSED")])
 
         # Call and Assert
-        with pytest.raises(new_payments.DeadLetterFailed):
+        with pytest.raises(rabbitmq.DeadLetterFailed):
             await dead_letters.publish(message(BODY, []), RuntimeError("x"), attempts=1)
 
     async def test__nack_is_permanent(self) -> None:
@@ -129,5 +130,5 @@ class TestPublish:
         dead_letters, _ = _dead_letters([commands.Basic.Nack(delivery_tag=1)])
 
         # Call and Assert
-        with pytest.raises(new_payments.DeadLetterFailed, match="отверг"):
+        with pytest.raises(rabbitmq.DeadLetterFailed, match="отверг"):
             await dead_letters.publish(message(BODY, []), RuntimeError("x"), attempts=1)

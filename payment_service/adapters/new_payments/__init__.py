@@ -1,33 +1,24 @@
-"""Входящий адаптер новых платежей: консьюмер RabbitMQ (FastStream) с DLQ.
+"""Входящий адаптер очереди новых платежей ``payments.new``.
 
 Разделение — как у HTTP-входа: ``messages`` — проводной формат (как ``*Body``), ``handler`` —
-сообщение → идентификатор → порт ``interfaces.Payment`` (как ``Controller``; ошибка разбора —
+сообщение → DTO → порт ``interfaces.Payment`` (как ``Controller``; ошибка разбора —
 ``InvalidMessage``, как ``RequestValidationError``), ``policy`` — исключение → действие по
-категориям ошибок ядра (как ``error_handlers``), ``consumer`` — подписка, повторы и
-подтверждения (как сервер), ``dead_letters`` — запись в DLQ, ``topology`` — очереди и DLQ. Об
-исходящем адаптере событий (``payment_events``) не знает; ``rabbitmq`` использует как библиотеку.
+категориям ошибок ядра и код причины для DLQ (как ``error_handlers``), ``settings`` — очередь,
+DLQ и дедлайны. Цикл, повторы, подтверждения и запись в DLQ (роль сервера) — библиотека
+``rabbitmq``; консьюмер собирает composition root. Об исходящем адаптере событий
+(``payment_events``) не знает.
 """
 
-from .consumer import NewPaymentsConsumer, RetryBudgetExhausted
-from .dead_letters import DeadLetterFailed, DeadLetters, DeadLetterUnavailable
 from .handler import InvalidMessage, NewPaymentsHandler
 from .messages import PaymentCreatedMessage
-from .policy import Action, action_for
+from .policy import action_for, error_code
 from .settings import Settings
-from .topology import QueueTopology, declare
 
 __all__ = [
-    "Action",
-    "DeadLetterFailed",
-    "DeadLetterUnavailable",
-    "DeadLetters",
     "InvalidMessage",
-    "NewPaymentsConsumer",
     "NewPaymentsHandler",
     "PaymentCreatedMessage",
-    "QueueTopology",
-    "RetryBudgetExhausted",
     "Settings",
     "action_for",
-    "declare",
+    "error_code",
 ]

@@ -9,6 +9,7 @@ from collections.abc import Callable
 from types import TracebackType
 from typing import Self
 
+from .inbox import InboxRepo
 from .outbox import OutboxRepo
 from .payments import PaymentsRepo
 
@@ -39,6 +40,11 @@ class UnitOfWork(ABC):
     @abstractmethod
     def outbox(self) -> OutboxRepo:
         """Исходящие события этой транзакции: публикуются, только если она зафиксирована."""
+
+    @property
+    @abstractmethod
+    def inbox(self) -> InboxRepo:
+        """Входящие сообщения, обработанные этой транзакцией: регистрация — вместе с эффектом."""
 
     @abstractmethod
     async def __aenter__(self) -> Self:

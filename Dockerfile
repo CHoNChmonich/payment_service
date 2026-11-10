@@ -1,6 +1,6 @@
 # Стадии: base → dependency-installer → builder (wheel проекта) → tests / production.
 # Контекст сборки — корень проекта (см. docker-compose.yml и .dockerignore). Один образ на
-# три процесса (api, relay, consumer): различаются entrypoint-скриптами.
+# четыре процесса (api, relay, consumer, notifier): различаются entrypoint-скриптами.
 
 # ====================================================
 # Базовый образ: общие переменные среды, пользователь приложения. Entrypoint-скрипты копируются в
@@ -61,7 +61,7 @@ ENTRYPOINT ["entrypoint_tests.sh"]
 
 # ====================================================
 # Production: только окружение с установленным пакетом — без uv, исходников и тестов; non-root.
-# Entrypoint задаёт compose: entrypoint_api.sh / entrypoint_relay.sh / entrypoint_consumer.sh
+# Entrypoint задаёт compose: entrypoint_api.sh / _relay.sh / _consumer.sh / _notifier.sh
 FROM base AS production
 
 COPY --from=builder --chown=app:app /app/.venv /app/.venv

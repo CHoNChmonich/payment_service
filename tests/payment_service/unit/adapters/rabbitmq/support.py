@@ -7,22 +7,36 @@ from typing import Any, cast
 from faststream.rabbit import RabbitExchange, RabbitMessage, RabbitQueue
 from pamqp import commands
 
-from payment_service.adapters import new_payments
+from payment_service.adapters import rabbitmq
 
 type Handler = Callable[[RabbitMessage], Awaitable[None]]
 
+TOPOLOGY = rabbitmq.QueueTopology(
+    exchange="payments",
+    queue="payments.new",
+    routing_key="payments.new",
+    dead_letter_exchange="payments.dlx",
+    dead_letter_queue="payments.new.dlq",
+)
 
-def settings(**overrides: float) -> new_payments.Settings:
+
+def config(**overrides: float) -> rabbitmq.ConsumerConfig:
     """Настройки с короткими паузами и бюджетом — тесты повторов идут доли секунды."""
-    values: dict[str, object] = {
-        "RABBITMQ_URL": "amqp://guest:guest@rabbitmq:5672/",
-        "NEW_PAYMENTS_HANDLER_TIMEOUT": 0.5,
-        "NEW_PAYMENTS_RETRY_BACKOFF": 0.01,
-        "NEW_PAYMENTS_RETRY_BACKOFF_MAX": 0.02,
-        "NEW_PAYMENTS_RETRY_BUDGET": 0.2,
-        "NEW_PAYMENTS_DLQ_PUBLISH_TIMEOUT": 1,
+    values: dict[str, float] = {
+        "handler_timeout": 0.5,
+        "retry_backoff": 0.01,
+        "retry_backoff_max": 0.02,
+        "retry_budget": 0.2,
+        "dlq_publish_timeout": 1,
+        "ping_timeout": 5,
     }
-    return new_payments.Settings.model_validate(values | overrides)
+    return rabbitmq.ConsumerConfig(topology=TOPOLOGY, **(values | overrides))
+
+
+def error_code(error: BaseException) -> str:
+    """Код причины для DLQ в тестах библиотеки: атрибут ``code`` или имя класса."""
+    code = getattr(error, "code", None)
+    return code if isinstance(code, str) else type(error).__name__
 
 
 class FakeRaw:

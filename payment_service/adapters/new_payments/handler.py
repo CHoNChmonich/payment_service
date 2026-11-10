@@ -16,11 +16,10 @@ class InvalidMessage(ValueError):
 
 
 class NewPaymentsHandler:
-    """Тело сообщения → идентификатор платежа → сценарии; о RabbitMQ и повторах не знает.
+    """Тело сообщения → событие → сценарий ``process``; о RabbitMQ и повторах не знает.
 
-    Попытка обработки — ``process`` (шлюз, статус) и затем ``notify`` (webhook). Шаги
-    идемпотентны по состоянию платежа: при повторной доставке уже обработанный платёж через шлюз
-    не прогоняется, доставленный webhook не отправляется заново.
+    Повторную доставку гасит inbox сценария по ``event_id``. Уведомление клиента — отдельное
+    событие ``payment_processed`` и отдельный консьюмер.
 
     Attributes:
         payment: Сценарии платежа.
@@ -35,21 +34,20 @@ class NewPaymentsHandler:
         self.payment = payment
 
     async def handle(self, body: bytes) -> bool:
-        """Разбирает событие, проводит платёж и уведомляет клиента.
+        """Разбирает событие и проводит платёж.
 
         Args:
             body: Тело сообщения.
 
         Returns:
-            ``True`` — webhook доставлен сейчас; ``False`` — был доставлен ранее (повторная
-            доставка сообщения).
+            ``True`` — платёж проведён сейчас; ``False`` — событие уже обработано (повторная
+            доставка).
 
         Raises:
             InvalidMessage: Тело не по контракту; ошибки сценариев — по контракту порта.
         """
         try:
-            payment_id = PaymentCreatedMessage.model_validate_json(body).to_application()
+            event = PaymentCreatedMessage.model_validate_json(body).to_application()
         except ValidationError as exc:
             raise InvalidMessage(f"Сообщение не по контракту: {exc}") from exc
-        await self.payment.process(payment_id)
-        return await self.payment.notify(payment_id)
+        return await self.payment.process(event)

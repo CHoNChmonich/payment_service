@@ -1,70 +1,151 @@
-"""Цикл консьюмера новых платежей: подписка, обработка, повторы, DLQ, подтверждения.
+"""Цикл консьюмера очереди: подписка, обработка, повторы, DLQ, подтверждения.
 
-Роль, которую у HTTP играет сервер: доставляет сообщения обработчику и превращает исход в
-действие с сообщением. Доставка не менее одного раза: сообщение подтверждается (``ack``) только
-после успеха или подтверждённой записи в DLQ; повторную доставку гасит состояние платежа.
+Роль, которую у HTTP играет сервер: доставляет сообщения обработчику адаптера и превращает исход
+в действие с сообщением по политике адаптера. Доставка не менее одного раза: сообщение
+подтверждается (``ack``) только после успеха или подтверждённой записи в DLQ; повторную
+доставку гасит обработчик (inbox сценария). Что делать с исключением, решает политика адаптера
+(``Action``): библиотека не знает ни ошибок ядра, ни формата сообщений.
 """
 
 import asyncio
 import contextlib
 import logging
-from collections.abc import Callable, Iterable
+from collections.abc import Awaitable, Callable, Iterable
+from dataclasses import dataclass
+from enum import StrEnum
 
 from faststream import AckPolicy
 from faststream.rabbit import RabbitBroker
 from faststream.rabbit.annotations import RabbitMessage
 
-from .dead_letters import DeadLetters, DeadLetterUnavailable
-from .handler import NewPaymentsHandler
-from .policy import Action, action_for
-from .settings import PING_INTERVAL, Settings
-from .topology import declare
+from .dead_letters import DeadLetters, DeadLetterTarget, DeadLetterUnavailable
+from .topology import QueueTopology, declare
 
 logger = logging.getLogger(__name__)
+
+# Как часто цикл консьюмера проверяет соединение с брокером и ставит метку «жив».
+PING_INTERVAL = 5.0
+# Запас ``graceful_timeout`` брокера сверх попытки и записи в DLQ: подтверждение и закрытие канала.
+GRACEFUL_MARGIN = 5.0
+# Запас остановки процесса сверх ``graceful_timeout``: закрытие соединения, хуки остановки.
+CLOSE_MARGIN = 10.0
+
+type Handler = Callable[[bytes], Awaitable[bool]]
+"""Обработчик тела: ``True`` — эффект применён сейчас, ``False`` — сообщение уже обработано."""
+
+
+class Action(StrEnum):
+    """Что делать с сообщением после неудачной попытки обработки."""
+
+    DEAD_LETTER = "dead_letter"
+    """Сообщение не обработать как есть: в DLQ, подтвердить, обработка идёт дальше."""
+
+    RETRY = "retry"
+    """Временный сбой собственной инфраструктуры: повтор того же сообщения после паузы."""
+
+    STOP = "stop"
+    """Дефект кода или конфигурации: остановить процесс, сообщение не подтверждать."""
+
+
+type Policy = Callable[[BaseException], Action]
+"""Политика адаптера: исключение попытки → действие консьюмера."""
+
+
+@dataclass(frozen=True)
+class ConsumerConfig:
+    """Очередь, дедлайны и повторы консьюмера; строит адаптер из своих настроек.
+
+    Attributes:
+        topology: Рабочая очередь, обменник, DLX и DLQ.
+        handler_timeout: Дедлайн одной попытки обработки в секундах; превышение — повтор.
+        retry_backoff: Пауза перед первым повтором; дальше удваивается.
+        retry_backoff_max: Наибольшая пауза между повторами.
+        retry_budget: Сколько секунд одно сообщение может повторяться; по исчерпании процесс
+            останавливается без подтверждения.
+        dlq_publish_timeout: Дедлайн подтверждения записи в DLQ в секундах.
+        ping_timeout: Сколько секунд ждать соединения с брокером на каждой проверке цикла.
+    """
+
+    topology: QueueTopology
+    handler_timeout: float
+    retry_backoff: float
+    retry_backoff_max: float
+    retry_budget: float
+    dlq_publish_timeout: float
+    ping_timeout: float
+
+    @property
+    def dead_letter_target(self) -> DeadLetterTarget:
+        """DLQ консьюмера и дедлайн записи в неё."""
+        return DeadLetterTarget(topology=self.topology, publish_timeout=self.dlq_publish_timeout)
+
+    @property
+    def graceful_timeout(self) -> float:
+        """Сколько секунд брокер ждёт завершения текущего сообщения при остановке.
+
+        Попытка обработки, запись в DLQ и запас на подтверждение: сообщение, обработка которого
+        началась до сигнала, дорабатывает и подтверждается.
+        """
+        return self.handler_timeout + self.dlq_publish_timeout + GRACEFUL_MARGIN
+
+    @property
+    def stop_grace(self) -> float:
+        """Сколько секунд нужно на остановку; ``stop_grace_period`` контейнера — не меньше."""
+        return self.graceful_timeout + CLOSE_MARGIN
+
+    @property
+    def heartbeat_gap(self) -> float:
+        """Наибольший промежуток между метками «жив» в секундах; порог healthcheck не меньше.
+
+        Цикл консьюмера ставит метку после каждой успешной проверки соединения, независимо от
+        обработки сообщений: промежуток — интервал проверки и её дедлайн.
+        """
+        return PING_INTERVAL + self.ping_timeout
 
 
 class RetryBudgetExhausted(RuntimeError):
     """Временный сбой не прошёл за бюджет повторов — процесс останавливается без подтверждения."""
 
 
-class NewPaymentsConsumer:
-    """Консьюмер очереди новых платежей; ``run`` — цикл процесса до события остановки.
+class QueueConsumer:
+    """Консьюмер одной очереди; ``run`` — цикл процесса до события остановки.
 
-    Политика исхода попытки — ``policy.action_for``: ``DEAD_LETTER`` — в DLQ и подтвердить,
-    ``RETRY`` — повтор с удваивающейся паузой в пределах ``NEW_PAYMENTS_RETRY_BUDGET`` (иначе
-    остановка), ``STOP`` — исключение сохраняется, процесс останавливается без подтверждения.
-    FastStream глотает исключения подписчика, поэтому остановка идёт через событие ``failed``:
-    цикл ``run`` замечает его, останавливает брокер и перебрасывает сохранённое исключение в
+    Политика исхода попытки — внедрённая ``action_for``: ``DEAD_LETTER`` — в DLQ и подтвердить,
+    ``RETRY`` — повтор с удваивающейся паузой в пределах бюджета (иначе остановка), ``STOP`` —
+    исключение сохраняется, процесс останавливается без подтверждения. FastStream глотает
+    исключения подписчика, поэтому остановка идёт через событие ``failed``: цикл ``run``
+    замечает его, останавливает брокер и перебрасывает сохранённое исключение в
     ``process.run``. Сигнал остановки прерывает паузу между повторами: сообщение остаётся
     неподтверждённым и вернётся в очередь при закрытии канала.
-
-    Attributes:
-        handler: Обработчик тела сообщения.
     """
 
     def __init__(
         self,
-        handler: NewPaymentsHandler,
+        handler: Handler,
+        action_for: Policy,
         dead_letters: DeadLetters,
-        settings: Settings,
+        config: ConsumerConfig,
         broker: RabbitBroker,
         heartbeat: Callable[[], None] = lambda: None,
     ) -> None:
-        """Принимает обработчик, DLQ, настройки и брокер из composition root.
+        """Принимает обработчик и политику адаптера, DLQ, настройки и брокер из composition root.
 
         Args:
             handler: Обработчик тела сообщения.
+            action_for: Политика ошибок адаптера.
             dead_letters: Публикатор DLQ на том же брокере.
-            settings: Очереди, дедлайны и повторы.
+            config: Очередь, дедлайны и повторы.
             broker: Брокер FastStream; подключается и останавливается в ``run``.
             heartbeat: Отметка «процесс жив»: после каждой проверки соединения и перед каждой
                 попыткой, паузой и записью в DLQ.
         """
-        self.handler = handler
+        self._handler = handler
+        self._action_for = action_for
         self._dead_letters = dead_letters
-        self._settings = settings
+        self._config = config
         self._broker = broker
         self._heartbeat = heartbeat
+        self._queue = config.topology.queue
         self._stop = asyncio.Event()
         self._failed = asyncio.Event()
         self._failure: BaseException | None = None
@@ -86,7 +167,7 @@ class NewPaymentsConsumer:
             Exception: Исключение обработки с действием ``STOP``.
         """
         self._stop = stop
-        topology = self._settings.topology
+        topology = self._config.topology
         self._broker.subscriber(
             topology.queue_object(declare=False),
             topology.exchange_object(declare=False),
@@ -97,7 +178,7 @@ class NewPaymentsConsumer:
             await declare(self._broker, topology)
             await self._broker.start()
             while not stop.is_set() and not self._failed.is_set():
-                if await self._broker.ping(self._settings.NEW_PAYMENTS_PING_TIMEOUT):
+                if await self._broker.ping(self._config.ping_timeout):
                     self._heartbeat()
                 else:
                     logger.warning("Брокер не отвечает: метка «жив» не обновлена")
@@ -113,15 +194,15 @@ class NewPaymentsConsumer:
         Args:
             message: Сообщение очереди с исходным сообщением aio-pika внутри.
         """
-        retries = _Retries(self._settings, self._stop)
+        retries = _Retries(self._config, self._stop)
         while True:
             self._heartbeat()
             retries.begin_attempt()
             try:
-                async with asyncio.timeout(self._settings.NEW_PAYMENTS_HANDLER_TIMEOUT):
-                    notified = await self.handler.handle(message.raw_message.body)
+                async with asyncio.timeout(self._config.handler_timeout):
+                    applied = await self._handler(message.raw_message.body)
             except Exception as exc:
-                action = action_for(exc)
+                action = self._action_for(exc)
                 if action is Action.STOP:
                     self._fail(exc)
                     return
@@ -129,16 +210,19 @@ class NewPaymentsConsumer:
                     await self._dead_letter(message, exc, retries)
                     return
                 logger.warning(
-                    "Временный сбой обработки платежа, попытка %s", retries.attempt, exc_info=True
+                    "Временный сбой обработки сообщения из %s, попытка %s",
+                    self._queue,
+                    retries.attempt,
+                    exc_info=True,
                 )
                 self._heartbeat()
                 if not await self._pause(retries, exc):
                     return
                 continue
-            if notified:
-                logger.info("Платёж обработан, webhook доставлен")
+            if applied:
+                logger.info("Сообщение из %s обработано", self._queue)
             else:
-                logger.info("Платёж обработан ранее, webhook уже доставлен — повторная доставка")
+                logger.info("Сообщение из %s обработано ранее — повторная доставка", self._queue)
             await self._ack(message)
             return
 
@@ -166,7 +250,10 @@ class NewPaymentsConsumer:
                 self._fail(exc)
                 return
             logger.warning(
-                "Сообщение отправлено в DLQ: %s", error, exc_info=(type(error), error, None)
+                "Сообщение из %s отправлено в DLQ: %s",
+                self._queue,
+                error,
+                exc_info=(type(error), error, None),
             )
             await self._ack(message)
             return
@@ -193,7 +280,7 @@ class NewPaymentsConsumer:
         Args:
             error: Исключение с действием ``STOP``.
         """
-        logger.error("Консьюмер останавливается: %s", error, exc_info=error)
+        logger.error("Консьюмер %s останавливается: %s", self._queue, error, exc_info=error)
         self._failure = error
         self._failed.set()
 
@@ -202,7 +289,7 @@ class NewPaymentsConsumer:
         """Подтверждает сообщение; отказ канала — предупреждение, сообщение вернётся само.
 
         Обычная причина отказа — канал закрыт после переподключения: брокер уже вернул
-        неподтверждённое сообщение в очередь, повтор погасит состояние платежа.
+        неподтверждённое сообщение в очередь, повтор погасит обработчик.
 
         Args:
             message: Обработанное сообщение.
@@ -216,17 +303,17 @@ class NewPaymentsConsumer:
 class _Retries:
     """Попытки одного сообщения: счётчик, пауза с удвоением и потолком, бюджет, остановка."""
 
-    def __init__(self, settings: Settings, stop: asyncio.Event) -> None:
+    def __init__(self, config: ConsumerConfig, stop: asyncio.Event) -> None:
         """Отсчитывает бюджет повторов от первой попытки.
 
         Args:
-            settings: Пауза, её потолок и бюджет повторов.
+            config: Пауза, её потолок и бюджет повторов.
             stop: Событие остановки процесса — прерывает паузу.
         """
         self._loop = asyncio.get_running_loop()
-        self._deadline = self._loop.time() + settings.NEW_PAYMENTS_RETRY_BUDGET
-        self._backoff = settings.NEW_PAYMENTS_RETRY_BACKOFF
-        self._backoff_max = settings.NEW_PAYMENTS_RETRY_BACKOFF_MAX
+        self._deadline = self._loop.time() + config.retry_budget
+        self._backoff = config.retry_backoff
+        self._backoff_max = config.retry_backoff_max
         self._stop = stop
         self._attempt = 0
 

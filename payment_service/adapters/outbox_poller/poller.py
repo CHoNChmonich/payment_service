@@ -5,7 +5,7 @@ import contextlib
 import logging
 from collections.abc import Callable
 
-from payment_service.application import errors, interfaces
+from payment_service.application import dtos, errors, interfaces
 
 from .settings import Settings
 
@@ -17,8 +17,9 @@ class OutboxPoller:
 
     Входящий адаптер, как контроллер у HTTP, но источник вызова — таймер: зависит от порта
     ``interfaces.EventRelay``, а не от сервиса. ``UnavailableError`` (брокер или БД
-    недоступны) — ожидаемый временный отказ: предупреждение и пауза. Любое другое исключение
-    уходит наружу и останавливает процесс: оркестратор перезапустит его, а сбой будет виден.
+    недоступны) — ожидаемый временный отказ: предупреждение и пауза. Сбой части дорожек при
+    успехе остальных — предупреждение без паузы. Любое другое исключение уходит наружу и
+    останавливает процесс: оркестратор перезапустит его, а сбой будет виден.
 
     Attributes:
         relay: Сценарий доставки событий outbox.
@@ -50,10 +51,16 @@ class OutboxPoller:
         while not stop.is_set():
             self._heartbeat()
             try:
-                published = await self.relay.relay()
+                result = await self.relay.relay()
             except errors.UnavailableError:
                 logger.warning("Доставка событий отложена: зависимость недоступна", exc_info=True)
-                published = 0
-            if not published:
+                result = dtos.RelayResult()
+            if result.unavailable:
+                logger.warning(
+                    "Доставка событий %s отложена: зависимость недоступна; остальных доставлено %s",
+                    ", ".join(result.unavailable),
+                    result.published,
+                )
+            if not result.published:
                 with contextlib.suppress(TimeoutError):
                     await asyncio.wait_for(stop.wait(), self._idle_interval)

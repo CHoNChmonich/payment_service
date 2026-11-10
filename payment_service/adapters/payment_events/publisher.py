@@ -2,13 +2,14 @@
 
 import logging
 from collections.abc import Callable, Sequence
+from typing import assert_never
 
 from faststream.rabbit import RabbitBroker
 
 from payment_service.adapters import rabbitmq
 from payment_service.application import dtos, errors, interfaces
 
-from .messages import CONTENT_TYPE, PaymentCreatedMessage
+from .messages import CONTENT_TYPE, PaymentEventMessage
 from .settings import Settings
 
 type BrokerFactory = Callable[[str], RabbitBroker]
@@ -28,10 +29,12 @@ class EventPublishingFailed(RuntimeError):
 class EventPublisher(interfaces.EventPublisher):
     """Публикатор событий платежей через брокер FastStream.
 
-    Публикация идёт в обменник с ``mandatory=True`` и подтверждением: сообщение, которое брокер
-    не смог положить ни в одну очередь (консьюмер ещё не объявил свою), возвращается и считается
-    неопубликованным — событие остаётся в outbox до следующего цикла relay. Брокер создаётся в
-    конструкторе, но подключается в ``aopen``: composition root импортируется и в тестах.
+    Ключ маршрутизации — по типу события: «платёж создан» — в очередь новых платежей, «платёж
+    проведён» — в очередь уведомлений. Публикация идёт в обменник с ``mandatory=True`` и
+    подтверждением: сообщение, которое брокер не смог положить ни в одну очередь (консьюмер ещё
+    не объявил свою), возвращается и считается неопубликованным — событие остаётся в outbox до
+    следующего цикла relay. Брокер создаётся в конструкторе, но подключается в ``aopen``:
+    composition root импортируется и в тестах.
     """
 
     def __init__(self, settings: Settings, broker_factory: BrokerFactory | None = None) -> None:
@@ -74,7 +77,7 @@ class EventPublisher(interfaces.EventPublisher):
             raise RuntimeError(f"RabbitMQ недоступен: {exc}") from exc
         self._opened = True
 
-    async def publish(self, events: Sequence[dtos.PaymentCreated]) -> None:
+    async def publish(self, events: Sequence[dtos.AnyPaymentEvent]) -> None:
         """Публикует события по одному и ждёт подтверждения размещения каждого.
 
         Args:
@@ -88,12 +91,13 @@ class EventPublisher(interfaces.EventPublisher):
         if not self._opened:
             raise RuntimeError("Публикатор не открыт: aopen не вызывался")
         for event in events:
-            message = PaymentCreatedMessage.from_application(event)
+            message = PaymentEventMessage.from_application(event)
+            routing_key = self._routing_key(event)
             try:
                 confirmation = await self._broker.publish(
                     message.body(),
                     exchange=self._exchange,
-                    routing_key=self._settings.PAYMENT_EVENTS_ROUTING_KEY,
+                    routing_key=routing_key,
                     mandatory=True,
                     persist=True,
                     message_id=str(event.event_id),
@@ -108,6 +112,23 @@ class EventPublisher(interfaces.EventPublisher):
             _check_confirmation(confirmation, event)
             logger.info("Событие %s опубликовано", _culprit(event))
 
+    def _routing_key(self, event: dtos.AnyPaymentEvent) -> str:
+        """Ключ маршрутизации по типу события; полноту разбора проверяет mypy.
+
+        Args:
+            event: Событие.
+
+        Returns:
+            Ключ очереди консьюмера этого типа событий.
+        """
+        match event:
+            case dtos.PaymentCreated():
+                return self._settings.PAYMENT_EVENTS_CREATED_ROUTING_KEY
+            case dtos.PaymentProcessed():
+                return self._settings.PAYMENT_EVENTS_PROCESSED_ROUTING_KEY
+            case _:
+                assert_never(event)
+
     async def aclose(self) -> None:
         """Закрывает соединение с брокером при остановке процесса."""
         if self._opened:
@@ -115,7 +136,7 @@ class EventPublisher(interfaces.EventPublisher):
             await self._broker.stop()
 
 
-def _check_confirmation(confirmation: object, event: dtos.PaymentCreated) -> None:
+def _check_confirmation(confirmation: object, event: dtos.AnyPaymentEvent) -> None:
     """Проверяет ответ брокера на публикацию.
 
     Возвращённое сообщение (очередь не готова) — временный сбой; отвергнутое брокером —
@@ -142,13 +163,13 @@ def _check_confirmation(confirmation: object, event: dtos.PaymentCreated) -> Non
             )
 
 
-def _culprit(event: dtos.PaymentCreated) -> str:
-    """Называет событие и платёж в тексте ошибки.
+def _culprit(event: dtos.AnyPaymentEvent) -> str:
+    """Называет событие, его тип и платёж в тексте ошибки.
 
     Args:
         event: Событие.
 
     Returns:
-        Строка вида «событие … платежа …».
+        Строка вида «событие … (тип) платежа …».
     """
-    return f"событие {event.event_id} платежа {event.payment_id}"
+    return f"событие {event.event_id} ({event.type}) платежа {event.payment_id}"

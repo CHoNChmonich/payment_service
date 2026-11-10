@@ -46,7 +46,6 @@ class TestSucceed:
         # Assert
         assert payment.status is entities.PaymentStatus.SUCCEEDED
         assert payment.processed_at == NOW
-        assert payment.is_final
 
     @pytest.mark.parametrize(
         "status", [entities.PaymentStatus.SUCCEEDED, entities.PaymentStatus.FAILED]
@@ -75,7 +74,6 @@ class TestFail:
         # Assert
         assert payment.status is entities.PaymentStatus.FAILED
         assert payment.processed_at == NOW
-        assert payment.is_final
 
     @pytest.mark.parametrize(
         "status", [entities.PaymentStatus.SUCCEEDED, entities.PaymentStatus.FAILED]
@@ -90,6 +88,75 @@ class TestFail:
 
         assert exc_info.value.context == {"id": PAYMENT_ID, "status": status, "action": "fail"}
         assert payment.status is status
+
+
+class TestEnsureProcessable:
+    def test__pending(self) -> None:
+        # Setup
+        payment = _payment()
+
+        # Call
+        payment.ensure_processable()
+
+        # Assert
+        assert payment.status is entities.PaymentStatus.PENDING
+
+    @pytest.mark.parametrize(
+        "status", [entities.PaymentStatus.SUCCEEDED, entities.PaymentStatus.FAILED]
+    )
+    def test__already_processed(self, status: entities.PaymentStatus) -> None:
+        # Setup
+        payment = _payment(status, processed_at=NOW)
+
+        # Call and Assert
+        with pytest.raises(errors.PaymentTransitionNotAllowed) as exc_info:
+            payment.ensure_processable()
+
+        assert exc_info.value.context == {"id": PAYMENT_ID, "status": status, "action": "process"}
+
+
+class TestEnsureNotifiable:
+    @pytest.mark.parametrize(
+        "status", [entities.PaymentStatus.SUCCEEDED, entities.PaymentStatus.FAILED]
+    )
+    def test__processed_not_notified(self, status: entities.PaymentStatus) -> None:
+        # Setup
+        payment = _payment(status, processed_at=NOW)
+
+        # Call
+        payment.ensure_notifiable()
+
+        # Assert
+        assert payment.notified_at is None
+
+    def test__pending(self) -> None:
+        # Setup
+        payment = _payment()
+
+        # Call and Assert
+        with pytest.raises(errors.PaymentTransitionNotAllowed) as exc_info:
+            payment.ensure_notifiable()
+
+        assert exc_info.value.context == {
+            "id": PAYMENT_ID,
+            "status": entities.PaymentStatus.PENDING,
+            "action": "notify",
+        }
+
+    def test__already_notified(self) -> None:
+        # Setup
+        payment = _payment(entities.PaymentStatus.SUCCEEDED, processed_at=NOW)
+        payment.mark_notified(NOW)
+
+        # Call and Assert
+        with pytest.raises(errors.PaymentTransitionNotAllowed) as exc_info:
+            payment.ensure_notifiable()
+
+        assert exc_info.value.context == {
+            "id": PAYMENT_ID,
+            "status": entities.PaymentStatus.SUCCEEDED,
+            "action": "notify",
+        }
 
 
 class TestMarkNotified:
@@ -122,19 +189,16 @@ class TestMarkNotified:
         }
         assert payment.notified_at is None
 
+    def test__already_notified(self) -> None:
+        # Setup
+        payment = _payment(entities.PaymentStatus.FAILED, processed_at=NOW)
+        payment.mark_notified(NOW)
 
-class TestIsFinal:
-    @pytest.mark.parametrize(
-        ("status", "expected"),
-        [
-            (entities.PaymentStatus.PENDING, False),
-            (entities.PaymentStatus.SUCCEEDED, True),
-            (entities.PaymentStatus.FAILED, True),
-        ],
-    )
-    def test__is_final(self, status: entities.PaymentStatus, expected: bool) -> None:
-        # Assert
-        assert _payment(status).is_final is expected
+        # Call and Assert
+        with pytest.raises(errors.PaymentTransitionNotAllowed):
+            payment.mark_notified(LATER)
+
+        assert payment.notified_at == NOW
 
 
 class TestMatches:

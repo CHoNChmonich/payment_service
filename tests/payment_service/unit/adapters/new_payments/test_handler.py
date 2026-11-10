@@ -1,21 +1,24 @@
 import json
-from unittest.mock import Mock, call
+from unittest.mock import Mock
 from uuid import UUID
 
 import pytest
 
 from payment_service.adapters import new_payments
-from payment_service.application import errors, interfaces
+from payment_service.application import dtos, errors, interfaces
 
 # ---------------------------------------------------------------------------------------
 # SETUP
 # ---------------------------------------------------------------------------------------
-PAYMENT_ID = UUID("22222222-2222-2222-2222-222222222222")
+EVENT = dtos.PaymentEventInfo(
+    event_id=UUID("11111111-1111-1111-1111-111111111111"),
+    payment_id=UUID("22222222-2222-2222-2222-222222222222"),
+)
 BODY = json.dumps(
     {
-        "event_id": "11111111-1111-1111-1111-111111111111",
+        "event_id": str(EVENT.event_id),
         "type": "payment_created",
-        "payment_id": str(PAYMENT_ID),
+        "payment_id": str(EVENT.payment_id),
     }
 ).encode()
 
@@ -34,18 +37,20 @@ def handler(payment: Mock) -> new_payments.NewPaymentsHandler:
 # TESTS
 # ---------------------------------------------------------------------------------------
 class TestHandle:
-    async def test__processes_then_notifies(
-        self, handler: new_payments.NewPaymentsHandler, payment: Mock
+    @pytest.mark.parametrize("applied", [True, False])
+    async def test__processes(
+        self, handler: new_payments.NewPaymentsHandler, payment: Mock, applied: bool
     ) -> None:
         # Setup
-        payment.notify.return_value = True
+        payment.process.return_value = applied
 
         # Call
-        notified = await handler.handle(BODY)
+        result = await handler.handle(BODY)
 
-        # Assert: webhook — только после проведения платежа
-        assert notified is True
-        assert payment.mock_calls == [call.process(PAYMENT_ID), call.notify(PAYMENT_ID)]
+        # Assert: только проведение — уведомление идёт отдельным событием
+        assert result is applied
+        payment.process.assert_awaited_once_with(EVENT)
+        payment.notify.assert_not_called()
 
     async def test__bad_body_is_invalid_message(
         self, handler: new_payments.NewPaymentsHandler, payment: Mock
@@ -59,9 +64,8 @@ class TestHandle:
         self, handler: new_payments.NewPaymentsHandler, payment: Mock
     ) -> None:
         # Setup
-        payment.process.side_effect = errors.PaymentNotFound(id=PAYMENT_ID)
+        payment.process.side_effect = errors.PaymentNotFound(id=EVENT.payment_id)
 
         # Call and Assert
         with pytest.raises(errors.PaymentNotFound):
             await handler.handle(BODY)
-        payment.notify.assert_not_called()

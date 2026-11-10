@@ -24,7 +24,7 @@ _TRANSIENT_SQLSTATES = frozenset(
 
 
 class UnitOfWork(interfaces.UnitOfWork):
-    """Транзакция SQLAlchemy над репозиториями платежей и outbox.
+    """Транзакция SQLAlchemy над репозиториями платежей, outbox и inbox.
 
     Паттерн: Adapter (GoF, в широком смысле) — приспосабливает ``AsyncSession`` к контракту
     порта ``interfaces.UnitOfWork``. Объект рассчитан на одну единицу работы за раз: вход в
@@ -37,6 +37,7 @@ class UnitOfWork(interfaces.UnitOfWork):
     _session: AsyncSession
     _payments: interfaces.PaymentsRepo
     _outbox: interfaces.OutboxRepo
+    _inbox: interfaces.InboxRepo
 
     def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
         """Запоминает фабрику сессий; сессия не создаётся до входа в контекст.
@@ -56,6 +57,11 @@ class UnitOfWork(interfaces.UnitOfWork):
         """Исходящие события этой транзакции."""
         return self._outbox
 
+    @property
+    def inbox(self) -> interfaces.InboxRepo:
+        """Входящие сообщения, обработанные этой транзакцией."""
+        return self._inbox
+
     async def __aenter__(self) -> Self:
         """Создаёт сессию и репозитории на ней; транзакция начнётся при первом запросе.
 
@@ -70,6 +76,7 @@ class UnitOfWork(interfaces.UnitOfWork):
         self._session = self._session_factory()
         self._payments = repositories.PaymentsRepo(self._session)
         self._outbox = repositories.OutboxRepo(self._session)
+        self._inbox = repositories.InboxRepo(self._session)
         return self
 
     async def __aexit__(
@@ -100,7 +107,7 @@ class UnitOfWork(interfaces.UnitOfWork):
             raise
         finally:
             await self._session.close()
-            del self._session, self._payments, self._outbox
+            del self._session, self._payments, self._outbox, self._inbox
         if self._is_transient(exc):
             raise errors.StorageUnavailable() from exc
 

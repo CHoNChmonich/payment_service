@@ -147,16 +147,20 @@ class IdempotencyKeyConflict(ConflictError):
     message_template = "Платёж с Idempotency-Key {idempotency_key} уже создан с другими данными"
 
 
+class MessageConflict(ConflictError):
+    """Входящее сообщение с этим идентификатором уже обработано, но с другим содержимым.
+
+    Источник повторно отправил сообщение с тем же ключом идемпотентности и другими данными —
+    это ошибка источника; молча считать такое сообщение дублем нельзя: данные потеряются.
+    """
+
+    message_template = "Сообщение {message_id} уже обработано с другим содержимым"
+
+
 class PaymentTransitionNotAllowed(RuleViolationError):
     """Действие недопустимо в текущем статусе платежа."""
 
     message_template = "Платёж {id} в статусе {status}: действие «{action}» недопустимо"
-
-
-class PaymentNotProcessed(RuleViolationError):
-    """Уведомление о результате запрошено до того, как платёж обработан."""
-
-    message_template = "Платёж {id} ещё не обработан: уведомлять не о чем"
 
 
 class CredentialsMissing(AuthenticationError):

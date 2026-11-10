@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Запуск консьюмера новых платежей. Миграции применяет api: compose запускает consumer после
-# его healthcheck.
+# Запуск консьюмера новых платежей (payments.new → шлюз). Миграции применяет api: compose
+# запускает consumer после его healthcheck.
 
 set -e
 

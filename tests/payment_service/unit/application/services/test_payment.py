@@ -12,6 +12,8 @@ from payment_service.application import dtos, entities, errors, interfaces, serv
 # ---------------------------------------------------------------------------------------
 NOW = datetime(2026, 1, 1, 12, 0, tzinfo=UTC)
 PAYMENT_ID = UUID("00000000-0000-0000-0000-000000000001")
+EVENT_ID = UUID("00000000-0000-0000-0000-0000000000e1")
+EVENT = dtos.PaymentEventInfo(event_id=EVENT_ID, payment_id=PAYMENT_ID)
 NEW_PAYMENT_INFO = dtos.NewPaymentInfo.model_validate(
     {
         "idempotency_key": "key-1",
@@ -30,6 +32,8 @@ def uow() -> MagicMock:
     unit_of_work.__aenter__.return_value = unit_of_work
     unit_of_work.payments = Mock(interfaces.PaymentsRepo)
     unit_of_work.outbox = Mock(interfaces.OutboxRepo)
+    unit_of_work.inbox = Mock(interfaces.InboxRepo)
+    unit_of_work.inbox.register.return_value = True
     return unit_of_work
 
 
@@ -83,11 +87,18 @@ def _added_payment(uow: MagicMock) -> entities.Payment:
     return payment
 
 
-def _added_event(uow: MagicMock) -> dtos.PaymentCreated:
+def _added_event(uow: MagicMock) -> dtos.AnyPaymentEvent:
     """Единственное событие, добавленное в outbox."""
     uow.outbox.add.assert_called_once()
-    event: dtos.PaymentCreated = uow.outbox.add.call_args.args[0]
+    event: dtos.AnyPaymentEvent = uow.outbox.add.call_args.args[0]
     return event
+
+
+def _fingerprint(uow: MagicMock) -> str:
+    """Отпечаток единственной регистрации события в inbox."""
+    uow.inbox.register.assert_called_once()
+    fingerprint: str = uow.inbox.register.call_args.args[1]
+    return fingerprint
 
 
 # ---------------------------------------------------------------------------------------
@@ -114,6 +125,7 @@ class TestCreate:
         assert payment.created_at == NOW
         assert payment.webhook_url == "http://webhook_sink:8080/hook"
         event = _added_event(uow)
+        assert isinstance(event, dtos.PaymentCreated)
         assert (event.payment_id, event.occurred_at) == (payment.id, NOW)
         assert result == dtos.PaymentInfo(
             id=payment.id,
@@ -203,47 +215,82 @@ class TestGet:
 
 
 class TestProcess:
-    async def test__succeeded(
-        self, service: services.Payment, uow: MagicMock, gateway: Mock
+    @pytest.mark.parametrize(
+        ("gateway_error", "status"),
+        [
+            (None, entities.PaymentStatus.SUCCEEDED),
+            (errors.GatewayUnavailable(), entities.PaymentStatus.FAILED),
+        ],
+        ids=["succeeded", "gateway_refused"],
+    )
+    async def test__processed(
+        self,
+        service: services.Payment,
+        uow: MagicMock,
+        gateway: Mock,
+        gateway_error: errors.Error | None,
+        status: entities.PaymentStatus,
     ) -> None:
         # Setup
         payment = _stored_payment()
         uow.payments.fetch_by_id.return_value = payment
+        gateway.charge.side_effect = gateway_error
         manager = Mock()
         manager.attach_mock(uow, "uow")
         manager.attach_mock(gateway, "gateway")
 
         # Call
-        result = await service.process(PAYMENT_ID)
+        result = await service.process(EVENT)
 
         # Assert
         assert manager.mock_calls == [
             call.uow.__aenter__(),
+            call.uow.inbox.register(EVENT_ID, ANY),  # первой операцией транзакции
             call.uow.payments.fetch_by_id(PAYMENT_ID, for_update=True),
             call.gateway.charge(ANY),  # под блокировкой, до фиксации результата
+            call.uow.outbox.add(ANY),  # событие — в той же транзакции, до commit
             call.uow.commit(),
             call.uow.__aexit__(None, None, None),
         ]
         charged: dtos.PaymentInfo = gateway.charge.call_args.args[0]
         assert (charged.id, charged.status) == (PAYMENT_ID, entities.PaymentStatus.PENDING)
-        assert (payment.status, payment.processed_at) == (entities.PaymentStatus.SUCCEEDED, NOW)
-        assert (result.status, result.processed_at) == (entities.PaymentStatus.SUCCEEDED, NOW)
+        # Отказ шлюза — результат платежа, а не сбой: тоже фиксируется и порождает событие
+        assert (payment.status, payment.processed_at) == (status, NOW)
+        event = _added_event(uow)
+        assert isinstance(event, dtos.PaymentProcessed)
+        assert (event.payment_id, event.occurred_at) == (PAYMENT_ID, NOW)
+        assert result is True
 
-    async def test__gateway_refused(
+    async def test__duplicate_event(
         self, service: services.Payment, uow: MagicMock, gateway: Mock
     ) -> None:
         # Setup
-        payment = _stored_payment()
-        uow.payments.fetch_by_id.return_value = payment
-        gateway.charge.side_effect = errors.GatewayUnavailable()
+        uow.inbox.register.return_value = False
 
         # Call
-        result = await service.process(PAYMENT_ID)
+        result = await service.process(EVENT)
 
         # Assert
-        uow.commit.assert_called_once()  # отказ шлюза — результат платежа, а не сбой
-        assert (payment.status, payment.processed_at) == (entities.PaymentStatus.FAILED, NOW)
-        assert result.status is entities.PaymentStatus.FAILED
+        assert uow.mock_calls == [
+            call.__aenter__(),
+            call.inbox.register(EVENT_ID, ANY),
+            call.__aexit__(None, None, None),
+        ]
+        gateway.charge.assert_not_called()  # повтор не читает платёж и не идёт в шлюз
+        assert result is False
+
+    async def test__conflicting_event(
+        self, service: services.Payment, uow: MagicMock, gateway: Mock
+    ) -> None:
+        # Setup
+        uow.inbox.register.side_effect = errors.MessageConflict(message_id=EVENT_ID)
+
+        # Call and Assert
+        with pytest.raises(errors.MessageConflict):
+            await service.process(EVENT)
+
+        uow.payments.fetch_by_id.assert_not_called()
+        gateway.charge.assert_not_called()
 
     @pytest.mark.parametrize(
         "status", [entities.PaymentStatus.SUCCEEDED, entities.PaymentStatus.FAILED]
@@ -258,13 +305,14 @@ class TestProcess:
         # Setup
         uow.payments.fetch_by_id.return_value = _stored_payment(status)
 
-        # Call
-        result = await service.process(PAYMENT_ID)
+        # Call and Assert
+        with pytest.raises(errors.PaymentTransitionNotAllowed) as exc_info:
+            await service.process(EVENT)
 
-        # Assert
-        gateway.charge.assert_not_called()  # повторная доставка не проводит платёж заново
+        assert exc_info.value.context["action"] == "process"
+        gateway.charge.assert_not_called()  # обработанный платёж через шлюз не проводится
+        uow.outbox.add.assert_not_called()
         uow.commit.assert_not_called()
-        assert result.status is status
 
     async def test__not_found(
         self, service: services.Payment, uow: MagicMock, gateway: Mock
@@ -274,9 +322,10 @@ class TestProcess:
 
         # Call and Assert
         with pytest.raises(errors.PaymentNotFound):
-            await service.process(PAYMENT_ID)
+            await service.process(EVENT)
 
         gateway.charge.assert_not_called()
+        uow.commit.assert_not_called()
 
     async def test__storage_failed_in_gateway_call(
         self, service: services.Payment, uow: MagicMock, gateway: Mock
@@ -287,8 +336,9 @@ class TestProcess:
 
         # Call and Assert
         with pytest.raises(errors.StorageUnavailable):
-            await service.process(PAYMENT_ID)
+            await service.process(EVENT)
 
+        uow.outbox.add.assert_not_called()
         uow.commit.assert_not_called()
 
 
@@ -304,11 +354,12 @@ class TestNotify:
         manager.attach_mock(notifier, "notifier")
 
         # Call
-        result = await service.notify(PAYMENT_ID)
+        result = await service.notify(EVENT)
 
         # Assert
         assert manager.mock_calls == [
             call.uow.__aenter__(),
+            call.uow.inbox.register(EVENT_ID, ANY),
             call.uow.payments.fetch_by_id(PAYMENT_ID, for_update=True),
             call.notifier.notify(ANY),  # отметка о доставке — только после ответа получателя
             call.uow.commit(),
@@ -319,48 +370,83 @@ class TestNotify:
         assert payment.notified_at == NOW
         assert result is True
 
-    async def test__already_notified(
+    async def test__duplicate_event(
         self, service: services.Payment, uow: MagicMock, notifier: Mock
     ) -> None:
         # Setup
-        uow.payments.fetch_by_id.return_value = _stored_payment(
-            entities.PaymentStatus.FAILED, notified_at=NOW
-        )
+        uow.inbox.register.return_value = False
 
         # Call
-        result = await service.notify(PAYMENT_ID)
+        result = await service.notify(EVENT)
 
         # Assert
+        assert uow.mock_calls == [
+            call.__aenter__(),
+            call.inbox.register(EVENT_ID, ANY),
+            call.__aexit__(None, None, None),
+        ]
         notifier.notify.assert_not_called()
-        uow.commit.assert_not_called()
         assert result is False
 
-    async def test__not_processed(
+    async def test__conflicting_event(
         self, service: services.Payment, uow: MagicMock, notifier: Mock
     ) -> None:
         # Setup
-        uow.payments.fetch_by_id.return_value = _stored_payment()
+        uow.inbox.register.side_effect = errors.MessageConflict(message_id=EVENT_ID)
 
         # Call and Assert
-        with pytest.raises(errors.PaymentNotProcessed) as exc_info:
-            await service.notify(PAYMENT_ID)
+        with pytest.raises(errors.MessageConflict):
+            await service.notify(EVENT)
 
-        assert exc_info.value.context == {"id": PAYMENT_ID}
+        uow.payments.fetch_by_id.assert_not_called()
         notifier.notify.assert_not_called()
+        uow.commit.assert_not_called()
 
-    async def test__not_found(self, service: services.Payment, uow: MagicMock) -> None:
+    @pytest.mark.parametrize(
+        ("status", "notified_at"),
+        [
+            (entities.PaymentStatus.PENDING, None),
+            (entities.PaymentStatus.FAILED, NOW),
+        ],
+        ids=["pending", "already_notified"],
+    )
+    async def test__not_notifiable(
+        self,
+        service: services.Payment,
+        uow: MagicMock,
+        notifier: Mock,
+        status: entities.PaymentStatus,
+        notified_at: datetime | None,
+    ) -> None:
+        # Setup
+        uow.payments.fetch_by_id.return_value = _stored_payment(status, notified_at=notified_at)
+
+        # Call and Assert
+        with pytest.raises(errors.PaymentTransitionNotAllowed) as exc_info:
+            await service.notify(EVENT)
+
+        assert exc_info.value.context["action"] == "notify"
+        notifier.notify.assert_not_called()
+        uow.commit.assert_not_called()
+
+    async def test__not_found(
+        self, service: services.Payment, uow: MagicMock, notifier: Mock
+    ) -> None:
         # Setup
         uow.payments.fetch_by_id.return_value = None
 
         # Call and Assert
         with pytest.raises(errors.PaymentNotFound):
-            await service.notify(PAYMENT_ID)
+            await service.notify(EVENT)
+
+        notifier.notify.assert_not_called()
 
     @pytest.mark.parametrize(
         "error",
         [
             errors.WebhookUnavailable(url="http://webhook_sink:8080/hook"),
             errors.WebhookRejected(url="http://webhook_sink:8080/hook", status_code=404),
+            errors.WebhookAddressInvalid(url="http://webhook_sink:8080/hook"),
         ],
     )
     async def test__delivery_failed(
@@ -373,7 +459,50 @@ class TestNotify:
 
         # Call and Assert
         with pytest.raises(type(error)):
-            await service.notify(PAYMENT_ID)
+            await service.notify(EVENT)
 
-        assert payment.notified_at is None  # отметки нет: повтор доставит снова
+        assert payment.notified_at is None  # ни отметки, ни регистрации: повтор доставит снова
         uow.commit.assert_not_called()
+
+
+class TestFingerprint:
+    async def test__other_event_id_same_content(
+        self, service: services.Payment, uow: MagicMock
+    ) -> None:
+        # Setup
+        uow.inbox.register.return_value = False
+        await service.process(EVENT)
+        first = _fingerprint(uow)
+        uow.inbox.register.reset_mock()
+
+        # Call
+        await service.process(EVENT.model_copy(update={"event_id": UUID(int=99)}))
+
+        # Assert
+        assert _fingerprint(uow) == first  # идентификатор события — ключ, а не содержимое
+
+    async def test__other_payment(self, service: services.Payment, uow: MagicMock) -> None:
+        # Setup
+        uow.inbox.register.return_value = False
+        await service.process(EVENT)
+        first = _fingerprint(uow)
+        uow.inbox.register.reset_mock()
+
+        # Call
+        await service.process(EVENT.model_copy(update={"payment_id": UUID(int=2)}))
+
+        # Assert
+        assert _fingerprint(uow) != first
+
+    async def test__scenarios_differ(self, service: services.Payment, uow: MagicMock) -> None:
+        # Setup
+        uow.inbox.register.return_value = False
+        await service.process(EVENT)
+        processed = _fingerprint(uow)
+        uow.inbox.register.reset_mock()
+
+        # Call
+        await service.notify(EVENT)
+
+        # Assert
+        assert _fingerprint(uow) != processed  # событие не того типа — конфликт, а не дубль

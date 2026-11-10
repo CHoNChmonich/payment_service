@@ -130,6 +130,7 @@ modules = [
     "payment_service.adapters.payment_events",
     "payment_service.adapters.outbox_poller",
     "payment_service.adapters.new_payments",
+    "payment_service.adapters.processed_payments",
     "payment_service.adapters.payment_gateway",
     "payment_service.adapters.webhook",
 ]
@@ -150,6 +151,7 @@ forbidden_modules = [
     "payment_service.adapters.payment_events",
     "payment_service.adapters.outbox_poller",
     "payment_service.adapters.new_payments",
+    "payment_service.adapters.processed_payments",
     "payment_service.adapters.payment_gateway",
     "payment_service.adapters.webhook",
 ]
@@ -160,6 +162,7 @@ type = "forbidden"
 source_modules = [
     "payment_service.adapters.api",
     "payment_service.adapters.new_payments",
+    "payment_service.adapters.processed_payments",
     "payment_service.adapters.outbox_poller",
 ]
 forbidden_modules = ["payment_service.application.services"]

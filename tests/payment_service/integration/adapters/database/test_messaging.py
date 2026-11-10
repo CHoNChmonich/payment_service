@@ -1,4 +1,4 @@
-"""Outbox в сценариях на реальном PostgreSQL: атомарность, гонка создания, доставка relay.
+"""Outbox в сценариях на реальном PostgreSQL: атомарность, гонка создания, дорожки relay.
 
 Транзакции коммитятся по-настоящему, как в ``test_unit_of_work``: схема удаляется после теста
 (``create_test_db``).
@@ -8,6 +8,7 @@ import asyncio
 from collections.abc import Sequence
 from decimal import Decimal
 from unittest.mock import Mock
+from uuid import uuid4
 
 import pytest
 from sqlalchemy import select
@@ -15,7 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from payment_service.adapters import database
 from payment_service.adapters.database import tables
-from payment_service.application import dtos, entities, errors, interfaces, services
+from payment_service.application import dtos, errors, interfaces, services
 
 from . import test_data
 from .test_unit_of_work import _wait_for_lock_waiter
@@ -44,12 +45,12 @@ class RecordingPublisher(interfaces.EventPublisher):
     """Публикатор-заглушка: запоминает пачки; может ждать разрешения или падать."""
 
     def __init__(self) -> None:
-        self.batches: list[list[dtos.PaymentCreated]] = []
+        self.batches: list[list[dtos.AnyPaymentEvent]] = []
         self.entered = asyncio.Event()
         self.release: asyncio.Event | None = None
         self.error: Exception | None = None
 
-    async def publish(self, events: Sequence[dtos.PaymentCreated]) -> None:
+    async def publish(self, events: Sequence[dtos.AnyPaymentEvent]) -> None:
         self.entered.set()
         if self.release is not None:
             await self.release.wait()
@@ -154,6 +155,35 @@ class TestOutboxAtomicity:
         assert await test_data.count_rows(tables.payments, session) == 0
         assert await test_data.count_rows(tables.outbox, session) == 0
 
+    async def test__failed_commit_after_charge_leaves_event_for_retry(
+        self,
+        service: services.Payment,
+        session_factory: async_sessionmaker[AsyncSession],
+        session: AsyncSession,
+    ) -> None:
+        """Шлюз принял платёж, но фиксация упала: ни статуса, ни события, ни регистрации —
+        повтор того же события проводит платёж (шлюз обязан быть идемпотентным)."""
+        # Setup
+        created = await service.create(_new_payment_info("key-1"))
+        event = dtos.PaymentEventInfo(event_id=uuid4(), payment_id=created.id)
+        gateway = Mock(interfaces.PaymentGateway)
+        failing = services.Payment(
+            uow_factory=lambda: FailingCommitUnitOfWork(session_factory),
+            gateway=gateway,
+            notifier=Mock(interfaces.WebhookNotifier),
+        )
+
+        # Call
+        with pytest.raises(RuntimeError, match="сбой фиксации"):
+            await failing.process(event)
+        repeated = await service.process(event)
+
+        # Assert
+        gateway.charge.assert_called_once()
+        assert repeated is True
+        assert await test_data.select_status(created.id, session) == "succeeded"
+        assert await test_data.count_rows(tables.inbox, session) == 1
+
 
 class TestCreateRace:
     async def test__concurrent_same_key_creates_one_payment(
@@ -209,6 +239,7 @@ class TestDeadline:
         """Дедлайн попытки консьюмера истёк, пока сценарий ждал блокировку платежа."""
         # Setup
         created = await service.create(_new_payment_info("key-1"))
+        event = dtos.PaymentEventInfo(event_id=uuid4(), payment_id=created.id)
 
         # Call: строку держит другая транзакция; обработка отменяется по дедлайну
         async with asyncio.timeout(WAIT_TIMEOUT), session_factory() as holder:
@@ -219,21 +250,22 @@ class TestDeadline:
             )
             with pytest.raises(TimeoutError):
                 async with asyncio.timeout(1.0):
-                    await _wait_for_lock_waiter_or_process(service, created, create_test_db)
+                    await _wait_for_lock_waiter_or_process(service, event, create_test_db)
             await holder.rollback()
         async with asyncio.timeout(WAIT_TIMEOUT):  # утёкшая транзакция держала бы строку
-            repeated = await service.process(created.id)
+            repeated = await service.process(event)
 
-        # Assert: отменённая транзакция откатилась — повтор обработал платёж
-        assert repeated.status is entities.PaymentStatus.SUCCEEDED
+        # Assert: отменённая транзакция откатилась вместе с регистрацией в inbox — повтор того
+        # же события обработал платёж
+        assert repeated is True
         assert await test_data.select_status(created.id, session) == "succeeded"
 
 
 async def _wait_for_lock_waiter_or_process(
-    service: services.Payment, created: dtos.PaymentInfo, engine: AsyncEngine
+    service: services.Payment, event: dtos.PaymentEventInfo, engine: AsyncEngine
 ) -> None:
     """Запускает обработку и убеждается, что она встала в очередь на блокировку."""
-    task = asyncio.create_task(service.process(created.id))
+    task = asyncio.create_task(service.process(event))
     try:
         await _wait_for_lock_waiter(engine)
         await task
@@ -256,7 +288,7 @@ class TestEventRelay:
         relay = services.EventRelay(uow_factory, publisher, batch_size=2)
 
         # Call
-        published = [await relay.relay() for _ in range(3)]
+        published = [(await relay.relay()).published for _ in range(3)]
 
         # Assert
         assert published == [2, 1, 0]
@@ -265,6 +297,62 @@ class TestEventRelay:
             [third.id],
         ]
         assert await test_data.count_rows(tables.outbox, session) == 0
+
+    async def test__lanes_by_event_type(
+        self,
+        service: services.Payment,
+        uow_factory: interfaces.UnitOfWorkFactory,
+        session: AsyncSession,
+    ) -> None:
+        # Setup: платёж создан и проведён — в outbox оба события
+        first = await service.create(_new_payment_info("key-1"))
+        await service.process(dtos.PaymentEventInfo(event_id=uuid4(), payment_id=first.id))
+        second = await service.create(_new_payment_info("key-2"))
+        publisher = RecordingPublisher()
+        relay = services.EventRelay(uow_factory, publisher, batch_size=10)
+
+        # Call
+        result = await relay.relay()
+
+        # Assert: пачка — события одного типа, у каждого типа — своя
+        assert result == dtos.RelayResult(published=3)
+        assert [
+            [(event.type, event.payment_id) for event in batch] for batch in publisher.batches
+        ] == [
+            [("payment_created", first.id), ("payment_created", second.id)],
+            [("payment_processed", first.id)],
+        ]
+        assert await test_data.count_rows(tables.outbox, session) == 0
+
+    async def test__unavailable_lane_does_not_block_others(
+        self,
+        service: services.Payment,
+        uow_factory: interfaces.UnitOfWorkFactory,
+        session: AsyncSession,
+    ) -> None:
+        # Setup: очередь новых платежей недоступна, очередь уведомлений — да
+        created = await service.create(_new_payment_info("key-1"))
+        await service.process(dtos.PaymentEventInfo(event_id=uuid4(), payment_id=created.id))
+
+        class CreatedLaneDown(RecordingPublisher):
+            async def publish(self, events: Sequence[dtos.AnyPaymentEvent]) -> None:
+                if events[0].type == "payment_created":
+                    raise errors.BrokerUnavailable()
+                await super().publish(events)
+
+        publisher = CreatedLaneDown()
+        relay = services.EventRelay(uow_factory, publisher, batch_size=10)
+
+        # Call
+        result = await relay.relay()
+
+        # Assert: дорожка уведомлений доставлена, события новых платежей ждут в outbox
+        assert result == dtos.RelayResult(published=1, unavailable=("payment_created",))
+        assert [[event.type for event in batch] for batch in publisher.batches] == [
+            ["payment_processed"]
+        ]
+        (payload,) = (await session.execute(select(tables.outbox.c.payload))).scalars()
+        assert payload["type"] == "payment_created"
 
     async def test__failed_publication_keeps_events(
         self,
@@ -303,6 +391,6 @@ class TestEventRelay:
             slow.release.set()
             first_result = await first_task
 
-        # Assert: второй не ждёт и не берёт те же события
-        assert (first_result, second_result) == (1, 0)
+        # Assert: второй не ждёт и не берёт те же события (у второй дорожки событий нет)
+        assert (first_result.published, second_result.published) == (1, 0)
         assert fast.batches == []

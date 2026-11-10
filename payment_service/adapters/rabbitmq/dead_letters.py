@@ -1,14 +1,17 @@
 """Dead Letter Queue: исходное сообщение и причина отказа в очередь недоставленных."""
 
+from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime
 
 from aio_pika.abc import AbstractIncomingMessage, HeadersType
 from faststream.rabbit import RabbitBroker, RabbitMessage
 
-from payment_service.adapters import rabbitmq
-from payment_service.application import errors
+from .errors import Confirmation, confirmation_of, is_temporary
+from .topology import QueueTopology
 
-from .settings import Settings
+type ErrorCode = Callable[[BaseException], str]
+"""Машинный код причины отказа для заголовка ``x-error-code``; задаёт политика адаптера."""
 
 ERROR_CODE_HEADER = "x-error-code"
 ERROR_HEADER = "x-error"
@@ -37,6 +40,19 @@ class DeadLetterFailed(RuntimeError):
     """Постоянный сбой записи в DLQ (права, отказ брокера) — повтор не поможет."""
 
 
+@dataclass(frozen=True)
+class DeadLetterTarget:
+    """Куда и с каким дедлайном писать недоставленные сообщения.
+
+    Attributes:
+        topology: Топология консьюмера: DLX и DLQ.
+        publish_timeout: Дедлайн подтверждения записи в DLQ в секундах.
+    """
+
+    topology: QueueTopology
+    publish_timeout: float
+
+
 class DeadLetters:
     """Публикатор DLQ через брокер процесса.
 
@@ -48,16 +64,20 @@ class DeadLetters:
     отвергнутые — она остаётся для сообщений, которые RabbitMQ отвергает сам.
     """
 
-    def __init__(self, settings: Settings, broker: RabbitBroker) -> None:
-        """Принимает настройки и брокер процесса (запуск и остановка — у консьюмера).
+    def __init__(
+        self, target: DeadLetterTarget, broker: RabbitBroker, error_code: ErrorCode
+    ) -> None:
+        """Принимает DLQ, брокер процесса (запуск и остановка — у консьюмера) и коды причин.
 
         Args:
-            settings: Имена DLX и DLQ, дедлайн записи.
+            target: DLX, DLQ и дедлайн записи.
             broker: Брокер FastStream, общий с консьюмером.
+            error_code: Код причины отказа; библиотека не знает ошибок ядра — код даёт адаптер.
         """
-        self._settings = settings
+        self._target = target
         self._broker = broker
-        self._exchange = settings.topology.dead_letter_exchange_object(declare=False)
+        self._error_code = error_code
+        self._exchange = target.topology.dead_letter_exchange_object(declare=False)
 
     async def publish(self, message: RabbitMessage, error: BaseException, attempts: int) -> None:
         """Пишет сообщение в DLQ и ждёт подтверждения записи.
@@ -76,7 +96,7 @@ class DeadLetters:
             confirmation = await self._broker.publish(
                 raw.body,
                 exchange=self._exchange,
-                routing_key=self._settings.NEW_PAYMENTS_DLQ,
+                routing_key=self._target.topology.dead_letter_queue,
                 mandatory=True,
                 persist=True,
                 message_id=raw.message_id,
@@ -85,18 +105,18 @@ class DeadLetters:
                     **_original_headers(raw.headers),
                     **self._reason_headers(error, attempts, raw),
                 },
-                timeout=self._settings.NEW_PAYMENTS_DLQ_PUBLISH_TIMEOUT,
+                timeout=self._target.publish_timeout,
             )
         except Exception as exc:
-            if rabbitmq.is_temporary(exc):
+            if is_temporary(exc):
                 raise DeadLetterUnavailable(f"DLQ недоступна: {exc}") from exc
             raise DeadLetterFailed(f"Запись в DLQ невозможна: {exc}") from exc
-        match rabbitmq.confirmation_of(confirmation):
-            case rabbitmq.Confirmation.ACKED:
+        match confirmation_of(confirmation):
+            case Confirmation.ACKED:
                 return
-            case rabbitmq.Confirmation.RETURNED:
+            case Confirmation.RETURNED:
                 raise DeadLetterUnavailable("DLQ недоступна: сообщение возвращено, очереди нет")
-            case rabbitmq.Confirmation.REJECTED:
+            case Confirmation.REJECTED:
                 raise DeadLetterFailed("Запись в DLQ невозможна: брокер отверг сообщение")
 
     def _reason_headers(
@@ -112,9 +132,8 @@ class DeadLetters:
         Returns:
             Имя заголовка → значение.
         """
-        code = error.code if isinstance(error, errors.Error) else type(error).__name__
         return {
-            ERROR_CODE_HEADER: code,
+            ERROR_CODE_HEADER: self._error_code(error),
             ERROR_HEADER: str(error)[:MAX_ERROR_TEXT],
             ATTEMPTS_HEADER: attempts,
             ORIGINAL_EXCHANGE_HEADER: raw.exchange or "",

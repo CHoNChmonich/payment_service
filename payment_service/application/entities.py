@@ -40,10 +40,22 @@ class PaymentStatus(StrEnum):
 class _PaymentState(ABC):
     """Паттерн: State (GoF). Поведение платежа, зависящее от его статуса.
 
-    ``Payment.succeed`` / ``Payment.fail`` / ``Payment.mark_notified`` делегируют объекту
-    состояния; недопустимый переход — ``PaymentTransitionNotAllowed``. Новый статус = новый
-    класс состояния + строка в ``_STATES``.
+    Методы ``Payment`` делегируют объекту состояния; недопустимое действие —
+    ``PaymentTransitionNotAllowed``. Проверки ``ensure_*`` идут до внешнего эффекта (шлюз,
+    webhook): недопустимое действие отклоняется, не начавшись. Новый статус = новый класс
+    состояния + строка в ``_STATES``.
     """
+
+    @abstractmethod
+    def ensure_processable(self, payment: Payment) -> None:
+        """Проверяет, что платёж можно проводить через шлюз.
+
+        Args:
+            payment: Платёж, который собираются провести.
+
+        Raises:
+            PaymentTransitionNotAllowed: Платёж уже обработан.
+        """
 
     @abstractmethod
     def succeed(self, payment: Payment, now: datetime) -> None:
@@ -70,20 +82,39 @@ class _PaymentState(ABC):
         """
 
     @abstractmethod
+    def ensure_notifiable(self, payment: Payment) -> None:
+        """Проверяет, что клиента можно уведомить о результате.
+
+        Args:
+            payment: Платёж, о котором собираются уведомить.
+
+        Raises:
+            PaymentTransitionNotAllowed: Результата ещё нет или клиент уже уведомлён.
+        """
+
     def mark_notified(self, payment: Payment, now: datetime) -> None:
-        """Отмечает, что клиент уведомлён о результате.
+        """Отмечает, что клиент уведомлён о результате; правило — ``ensure_notifiable``.
 
         Args:
             payment: Платёж, о котором доставлено уведомление.
             now: Момент доставки.
 
         Raises:
-            PaymentTransitionNotAllowed: Результата ещё нет — уведомлять не о чем.
+            PaymentTransitionNotAllowed: Результата ещё нет или клиент уже уведомлён.
         """
+        self.ensure_notifiable(payment)
+        payment.notified_at = now
 
 
 class _PendingState(_PaymentState):
     """Платёж в обработке: может стать успешным или неуспешным; уведомлять ещё не о чем."""
+
+    def ensure_processable(self, payment: Payment) -> None:
+        """Платёж в обработке можно проводить.
+
+        Args:
+            payment: Платёж в статусе ``pending``.
+        """
 
     def succeed(self, payment: Payment, now: datetime) -> None:
         """Фиксирует успех платежа.
@@ -105,12 +136,11 @@ class _PendingState(_PaymentState):
         payment.status = PaymentStatus.FAILED
         payment.processed_at = now
 
-    def mark_notified(self, payment: Payment, now: datetime) -> None:
-        """Отклоняет отметку об уведомлении: результата ещё нет.
+    def ensure_notifiable(self, payment: Payment) -> None:
+        """Отклоняет уведомление: результата ещё нет.
 
         Args:
             payment: Платёж в статусе ``pending``.
-            now: Момент; не используется.
 
         Raises:
             PaymentTransitionNotAllowed: Всегда.
@@ -121,7 +151,20 @@ class _PendingState(_PaymentState):
 
 
 class _FinalState(_PaymentState):
-    """Обработанный платёж: статус больше не меняется, уведомление допустимо."""
+    """Обработанный платёж: статус больше не меняется, уведомление — один раз."""
+
+    def ensure_processable(self, payment: Payment) -> None:
+        """Отклоняет повторное проведение через шлюз.
+
+        Args:
+            payment: Платёж в статусе ``succeeded`` или ``failed``.
+
+        Raises:
+            PaymentTransitionNotAllowed: Всегда.
+        """
+        raise errors.PaymentTransitionNotAllowed(
+            id=payment.id, status=payment.status, action="process"
+        )
 
     def succeed(self, payment: Payment, now: datetime) -> None:
         """Отклоняет повторную обработку.
@@ -151,14 +194,19 @@ class _FinalState(_PaymentState):
             id=payment.id, status=payment.status, action="fail"
         )
 
-    def mark_notified(self, payment: Payment, now: datetime) -> None:
-        """Запоминает момент доставки уведомления.
+    def ensure_notifiable(self, payment: Payment) -> None:
+        """Допускает уведомление, если клиент ещё не уведомлён.
 
         Args:
             payment: Платёж в финальном статусе.
-            now: Момент доставки.
+
+        Raises:
+            PaymentTransitionNotAllowed: Клиент уже уведомлён.
         """
-        payment.notified_at = now
+        if payment.notified_at is not None:
+            raise errors.PaymentTransitionNotAllowed(
+                id=payment.id, status=payment.status, action="notify"
+            )
 
 
 _STATES: dict[PaymentStatus, _PaymentState] = {
@@ -206,10 +254,13 @@ class Payment:
     processed_at: datetime | None = None
     notified_at: datetime | None = None
 
-    @property
-    def is_final(self) -> bool:
-        """Обработан ли платёж: статус ``succeeded`` или ``failed``."""
-        return self.status is not PaymentStatus.PENDING
+    def ensure_processable(self) -> None:
+        """Проверяет до обращения к шлюзу, что платёж ещё в обработке.
+
+        Raises:
+            PaymentTransitionNotAllowed: Платёж уже обработан.
+        """
+        _STATES[self.status].ensure_processable(self)
 
     def succeed(self, now: datetime) -> None:
         """Фиксирует успех платежа (``pending → succeeded``).
@@ -233,14 +284,22 @@ class Payment:
         """
         _STATES[self.status].fail(self, now)
 
+    def ensure_notifiable(self) -> None:
+        """Проверяет до отправки уведомления, что результат есть и клиент ещё не уведомлён.
+
+        Raises:
+            PaymentTransitionNotAllowed: Платёж не обработан или клиент уже уведомлён.
+        """
+        _STATES[self.status].ensure_notifiable(self)
+
     def mark_notified(self, now: datetime) -> None:
-        """Запоминает доставку уведомления о результате.
+        """Запоминает доставку уведомления о результате — не более одного раза.
 
         Args:
             now: Момент доставки.
 
         Raises:
-            PaymentTransitionNotAllowed: Платёж ещё не обработан.
+            PaymentTransitionNotAllowed: Платёж не обработан или клиент уже уведомлён.
         """
         _STATES[self.status].mark_notified(self, now)
 

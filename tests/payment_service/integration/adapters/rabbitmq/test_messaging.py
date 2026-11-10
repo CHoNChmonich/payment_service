@@ -1,4 +1,5 @@
-"""Шов публикатор → брокер → консьюмер: доставка, подтверждение, DLQ, возврат в очередь."""
+"""Шов публикатор → брокер → консьюмеры: маршрутизация по типу события, подтверждение, DLQ,
+возврат в очередь."""
 
 import asyncio
 import contextlib
@@ -6,14 +7,14 @@ import json
 from collections.abc import AsyncIterator, Awaitable
 from datetime import UTC, datetime
 from unittest.mock import Mock
-from uuid import UUID, uuid4
+from uuid import uuid4
 
 import aio_pika
 import pytest
 from aio_pika.abc import AbstractIncomingMessage
 from aiormq.exceptions import ChannelPreconditionFailed
 
-from payment_service.adapters import new_payments, payment_events, rabbitmq
+from payment_service.adapters import new_payments, payment_events, processed_payments, rabbitmq
 from payment_service.application import dtos, errors, interfaces
 
 from .conftest import Names
@@ -26,6 +27,16 @@ TIMEOUT = 15
 
 def _event() -> dtos.PaymentCreated:
     return dtos.PaymentCreated(event_id=uuid4(), occurred_at=datetime.now(UTC), payment_id=uuid4())
+
+
+def _processed_event() -> dtos.PaymentProcessed:
+    return dtos.PaymentProcessed(
+        event_id=uuid4(), occurred_at=datetime.now(UTC), payment_id=uuid4()
+    )
+
+
+def _info(event: dtos.AnyPaymentEvent) -> dtos.PaymentEventInfo:
+    return dtos.PaymentEventInfo(event_id=event.event_id, payment_id=event.payment_id)
 
 
 @pytest.fixture(scope="function")
@@ -41,15 +52,23 @@ async def publisher(
 
 
 @pytest.fixture(scope="function")
-async def declared(consumer_settings: new_payments.Settings) -> None:
-    # Топология объявляется до публикации: иначе сообщение с mandatory вернётся (очереди нет)
+async def declared(
+    consumer_settings: new_payments.Settings, processed_settings: processed_payments.Settings
+) -> None:
+    # Топология объявляется до публикации: иначе сообщение с mandatory вернётся (очереди нет).
+    # Каждая очередь — дважды: повторное объявление идемпотентно; общие обменник и DLX двумя
+    # консьюмерами объявляются одинаково
     broker = rabbitmq.create_broker(
         consumer_settings.RABBITMQ_URL.get_secret_value(), graceful_timeout=5
     )
     await broker.connect()
+    topologies = [
+        consumer_settings.consumer_config.topology,
+        processed_settings.consumer_config.topology,
+    ]
     try:
-        await new_payments.declare(broker, consumer_settings.topology)
-        await new_payments.declare(broker, consumer_settings.topology)  # повторно — идемпотентно
+        for topology in topologies * 2:
+            await rabbitmq.declare(broker, topology)
     finally:
         await broker.stop()
 
@@ -57,11 +76,43 @@ async def declared(consumer_settings: new_payments.Settings) -> None:
 async def _run_consumer(
     settings: new_payments.Settings, payment: Mock, until: Awaitable[object]
 ) -> None:
-    broker = rabbitmq.create_broker(settings.RABBITMQ_URL.get_secret_value(), graceful_timeout=5)
-    consumer = new_payments.NewPaymentsConsumer(
-        handler=new_payments.NewPaymentsHandler(payment),
-        dead_letters=new_payments.DeadLetters(settings, broker),
-        settings=settings,
+    await _run_queue_consumer(
+        settings.RABBITMQ_URL.get_secret_value(),
+        settings.consumer_config,
+        new_payments.NewPaymentsHandler(payment).handle,
+        new_payments.action_for,
+        new_payments.error_code,
+        until,
+    )
+
+
+async def _run_notifier(
+    settings: processed_payments.Settings, payment: Mock, until: Awaitable[object]
+) -> None:
+    await _run_queue_consumer(
+        settings.RABBITMQ_URL.get_secret_value(),
+        settings.consumer_config,
+        processed_payments.ProcessedPaymentsHandler(payment).handle,
+        processed_payments.action_for,
+        processed_payments.error_code,
+        until,
+    )
+
+
+async def _run_queue_consumer(
+    url: str,
+    config: rabbitmq.ConsumerConfig,
+    handler: rabbitmq.Handler,
+    action_for: rabbitmq.Policy,
+    error_code: rabbitmq.ErrorCode,
+    until: Awaitable[object],
+) -> None:
+    broker = rabbitmq.create_broker(url, graceful_timeout=5)
+    consumer = rabbitmq.QueueConsumer(
+        handler=handler,
+        action_for=action_for,
+        dead_letters=rabbitmq.DeadLetters(config.dead_letter_target, broker, error_code),
+        config=config,
         broker=broker,
     )
     stop = asyncio.Event()
@@ -85,7 +136,7 @@ async def _set_after(until: Awaitable[object], stop: asyncio.Event) -> None:
 def _handled(payment: Mock, method: str, outcome: Exception | object = None) -> asyncio.Event:
     handled = asyncio.Event()
 
-    async def side_effect(payment_id: UUID) -> object:
+    async def side_effect(event: dtos.PaymentEventInfo) -> object:
         handled.set()
         if isinstance(outcome, Exception):
             raise outcome
@@ -127,17 +178,74 @@ class TestPublisherToConsumer:
         # Setup
         event = _event()
         payment = Mock(interfaces.Payment)
-        handled = _handled(payment, "notify", outcome=True)
+        handled = _handled(payment, "process", outcome=True)
 
         # Call
         await publisher.publish([event])
         await _run_consumer(consumer_settings, payment, handled.wait())
 
-        # Assert: сценарии получили payment_id, сообщение подтверждено — очередь пуста
-        payment.process.assert_awaited_once_with(event.payment_id)
-        payment.notify.assert_awaited_once_with(event.payment_id)
+        # Assert: сценарий получил событие, сообщение подтверждено — очередь пуста
+        payment.process.assert_awaited_once_with(_info(event))
+        payment.notify.assert_not_called()
         url = consumer_settings.RABBITMQ_URL.get_secret_value()
         assert await _message_count(url, names.queue) == 0
+        assert await _message_count(url, names.dlq) == 0
+
+    @pytest.mark.usefixtures("declared")
+    async def test__events_are_routed_by_type(
+        self,
+        publisher: payment_events.EventPublisher,
+        consumer_settings: new_payments.Settings,
+        processed_settings: processed_payments.Settings,
+        names: Names,
+    ) -> None:
+        # Setup
+        created, processed = _event(), _processed_event()
+        url = consumer_settings.RABBITMQ_URL.get_secret_value()
+        payment = Mock(interfaces.Payment)
+        handled = _handled(payment, "notify", outcome=True)
+
+        # Call
+        await publisher.publish([created, processed])
+        counts = (
+            await _message_count(url, names.queue),
+            await _message_count(url, names.processed_queue),
+        )
+        await _run_notifier(processed_settings, payment, handled.wait())
+
+        # Assert: по сообщению в очередь своего типа; консьюмер уведомлений получил своё
+        assert counts == (1, 1)
+        payment.notify.assert_awaited_once_with(_info(processed))
+        payment.process.assert_not_called()
+        assert await _message_count(url, names.processed_queue) == 0
+        assert await _message_count(url, names.queue) == 1
+        assert await _message_count(url, names.processed_dlq) == 0
+
+    @pytest.mark.usefixtures("declared")
+    async def test__rejected_notification_lands_in_its_dlq(
+        self,
+        publisher: payment_events.EventPublisher,
+        processed_settings: processed_payments.Settings,
+        names: Names,
+    ) -> None:
+        # Setup
+        event = _processed_event()
+        payment = Mock(interfaces.Payment)
+        handled = _handled(
+            payment, "notify", outcome=errors.WebhookRejected(url="u", status_code=410)
+        )
+
+        # Call
+        await publisher.publish([event])
+        await _run_notifier(processed_settings, payment, handled.wait())
+
+        # Assert: своя DLQ уведомлений, DLQ новых платежей не тронута
+        url = processed_settings.RABBITMQ_URL.get_secret_value()
+        dead = await _get_message(url, names.processed_dlq)
+        assert dead.message_id == str(event.event_id)
+        assert dead.headers["x-event-type"] == "payment_processed"
+        assert dead.headers["x-error-code"] == "webhook_rejected"
+        assert dead.headers["x-original-routing-key"] == names.processed_routing_key
         assert await _message_count(url, names.dlq) == 0
 
     @pytest.mark.usefixtures("declared")
@@ -200,8 +308,17 @@ class TestPublisherToConsumer:
         # Setup: первая попытка — сбой хранилища, вторая успешна
         event = _event()
         payment = Mock(interfaces.Payment)
-        payment.process.side_effect = [errors.StorageUnavailable(), None]
-        handled = _handled(payment, "notify", outcome=True)
+        handled = asyncio.Event()
+        outcomes: list[Exception | bool] = [errors.StorageUnavailable(), True]
+
+        async def process(info: dtos.PaymentEventInfo) -> bool:
+            outcome = outcomes.pop(0)
+            if isinstance(outcome, Exception):
+                raise outcome
+            handled.set()
+            return outcome
+
+        payment.process.side_effect = process
 
         # Call
         await publisher.publish([event])
@@ -243,7 +360,7 @@ class TestDeclare:
         # Call and Assert: PRECONDITION_FAILED — не временный сбой
         try:
             with pytest.raises(ChannelPreconditionFailed) as excinfo:
-                await new_payments.declare(broker, consumer_settings.topology)
+                await rabbitmq.declare(broker, consumer_settings.consumer_config.topology)
             assert not rabbitmq.is_temporary(excinfo.value)
         finally:
             await broker.stop()

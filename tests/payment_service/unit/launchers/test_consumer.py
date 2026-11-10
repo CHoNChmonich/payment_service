@@ -3,7 +3,7 @@ from types import ModuleType
 
 import pytest
 
-from payment_service.adapters import database, new_payments, payment_gateway, webhook
+from payment_service.adapters import database, new_payments, payment_gateway, rabbitmq
 
 
 # ---------------------------------------------------------------------------------------
@@ -31,14 +31,13 @@ def _db(lock_timeout_ms: int | None) -> database.Settings:
     )
 
 
-def _payments(handler_timeout: float = 90) -> new_payments.Settings:
+def _payments(handler_timeout: float = 60) -> new_payments.Settings:
     return new_payments.Settings.model_validate(
         {"RABBITMQ_URL": "amqp://x", "NEW_PAYMENTS_HANDLER_TIMEOUT": handler_timeout}
     )
 
 
 GATEWAY = payment_gateway.Settings.model_validate({})
-WEBHOOK = webhook.Settings.model_validate({})
 
 
 # ---------------------------------------------------------------------------------------
@@ -46,23 +45,27 @@ WEBHOOK = webhook.Settings.model_validate({})
 # ---------------------------------------------------------------------------------------
 class TestCheckTimings:
     def test__defaults_are_consistent(self, launcher: ModuleType) -> None:
-        # Call: не поднимает — 20 с ≥ 18 с удержания, 90 с ≥ 40 + 18 + 18
-        launcher.check_timings(_db(20_000), _payments(), GATEWAY, WEBHOOK)
+        # Call: не поднимает — 20 с ≥ 18 с удержания, 60 с ≥ 20 + 18
+        launcher.check_timings(_db(20_000), _payments(), GATEWAY)
 
     def test__lock_timeout_is_required(self, launcher: ModuleType) -> None:
         # Call and Assert
         with pytest.raises(ValueError, match="обязателен"):
-            launcher.check_timings(_db(None), _payments(), GATEWAY, WEBHOOK)
+            launcher.check_timings(_db(None), _payments(), GATEWAY)
 
     def test__lock_timeout_below_longest_hold(self, launcher: ModuleType) -> None:
         # Call and Assert
         with pytest.raises(ValueError, match="худшего удержания"):
-            launcher.check_timings(_db(10_000), _payments(), GATEWAY, WEBHOOK)
+            launcher.check_timings(_db(10_000), _payments(), GATEWAY)
+
+    def test__handler_timeout_exactly_needed(self, launcher: ModuleType) -> None:
+        # Call: не поднимает — граница включена
+        launcher.check_timings(_db(20_000), _payments(20 + GATEWAY.worst_case), GATEWAY)
 
     def test__handler_timeout_below_needed(self, launcher: ModuleType) -> None:
         # Call and Assert
         with pytest.raises(ValueError, match="NEW_PAYMENTS_HANDLER_TIMEOUT"):
-            launcher.check_timings(_db(20_000), _payments(60), GATEWAY, WEBHOOK)
+            launcher.check_timings(_db(20_000), _payments(30), GATEWAY)
 
 
 class TestComposition:
@@ -73,11 +76,11 @@ class TestComposition:
             assert type(uow) is database.UnitOfWork
         # Консьюмер и DLQ — на одном брокере: подключает его только запуск консьюмера
         consumer = launcher.Consumers.new_payments
-        assert isinstance(consumer, new_payments.NewPaymentsConsumer)
+        assert isinstance(consumer, rabbitmq.QueueConsumer)
         assert consumer._broker is launcher.Adapters.dead_letters._broker
 
     def test__payment_ports_under_retries(self, launcher: ModuleType) -> None:
         # Assert
         payment = launcher.Application.payment
         assert isinstance(payment.gateway, payment_gateway.RetryingPaymentGateway)
-        assert isinstance(payment.notifier, webhook.RetryingWebhookNotifier)
+        assert payment.notifier is launcher.Adapters.notifier_client  # процессу не нужен

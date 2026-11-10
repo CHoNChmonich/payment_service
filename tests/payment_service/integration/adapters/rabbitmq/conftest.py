@@ -15,7 +15,7 @@ from pydantic import SecretStr, ValidationError
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from payment_service import ENV_FILE
-from payment_service.adapters import new_payments, payment_events
+from payment_service.adapters import new_payments, payment_events, processed_payments
 
 
 class RabbitTestSettings(BaseSettings):
@@ -26,13 +26,16 @@ class RabbitTestSettings(BaseSettings):
 
 @dataclass(frozen=True)
 class Names:
-    """Имена объектов одного теста."""
+    """Имена объектов одного теста: общий обменник и DLX, по очереди и DLQ на консьюмер."""
 
     exchange: str
     queue: str
     routing_key: str
     dlx: str
     dlq: str
+    processed_queue: str
+    processed_routing_key: str
+    processed_dlq: str
 
 
 @pytest.fixture(scope="session")
@@ -52,6 +55,9 @@ async def names(rabbitmq_url: str) -> AsyncIterator[Names]:
         routing_key="payments.new",
         dlx=f"test.{suffix}.payments.dlx",
         dlq=f"test.{suffix}.payments.new.dlq",
+        processed_queue=f"test.{suffix}.payments.processed",
+        processed_routing_key="payments.processed",
+        processed_dlq=f"test.{suffix}.payments.processed.dlq",
     )
 
     yield created
@@ -60,7 +66,7 @@ async def names(rabbitmq_url: str) -> AsyncIterator[Names]:
     connection = await aio_pika.connect_robust(rabbitmq_url)
     async with connection:
         channel = await connection.channel()
-        for queue in (created.queue, created.dlq):
+        for queue in (created.queue, created.dlq, created.processed_queue, created.processed_dlq):
             await channel.queue_delete(queue, if_unused=False, if_empty=False)
         for exchange in (created.exchange, created.dlx):
             await channel.exchange_delete(exchange, if_unused=False)
@@ -87,12 +93,33 @@ def consumer_settings(rabbitmq_url: str, names: Names) -> new_payments.Settings:
 
 
 @pytest.fixture(scope="function")
+def processed_settings(rabbitmq_url: str, names: Names) -> processed_payments.Settings:
+    return processed_payments.Settings.model_validate(
+        {
+            "RABBITMQ_URL": rabbitmq_url,
+            "PROCESSED_PAYMENTS_EXCHANGE": names.exchange,
+            "PROCESSED_PAYMENTS_QUEUE": names.processed_queue,
+            "PROCESSED_PAYMENTS_ROUTING_KEY": names.processed_routing_key,
+            "PROCESSED_PAYMENTS_DLX": names.dlx,
+            "PROCESSED_PAYMENTS_DLQ": names.processed_dlq,
+            "PROCESSED_PAYMENTS_HANDLER_TIMEOUT": 5,
+            "PROCESSED_PAYMENTS_RETRY_BACKOFF": 0.05,
+            "PROCESSED_PAYMENTS_RETRY_BACKOFF_MAX": 0.1,
+            "PROCESSED_PAYMENTS_RETRY_BUDGET": 5,
+            "PROCESSED_PAYMENTS_DLQ_PUBLISH_TIMEOUT": 5,
+            "PROCESSED_PAYMENTS_PING_TIMEOUT": 2,
+        }
+    )
+
+
+@pytest.fixture(scope="function")
 def publisher_settings(rabbitmq_url: str, names: Names) -> payment_events.Settings:
     return payment_events.Settings.model_validate(
         {
             "RABBITMQ_URL": rabbitmq_url,
             "PAYMENT_EVENTS_EXCHANGE": names.exchange,
-            "PAYMENT_EVENTS_ROUTING_KEY": names.routing_key,
+            "PAYMENT_EVENTS_CREATED_ROUTING_KEY": names.routing_key,
+            "PAYMENT_EVENTS_PROCESSED_ROUTING_KEY": names.processed_routing_key,
             "PAYMENT_EVENTS_PUBLISH_TIMEOUT": 5,
         }
     )

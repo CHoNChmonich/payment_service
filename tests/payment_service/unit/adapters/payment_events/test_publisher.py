@@ -112,6 +112,21 @@ class TestPublish:
             "payment_id": str(EVENT.payment_id),
         }
 
+    async def test__routing_key_by_event_type(self) -> None:
+        # Setup
+        broker = FakeBroker()
+        publisher = await _publisher(broker)
+        processed = dtos.PaymentProcessed(payment_id=EVENT.payment_id)
+
+        # Call
+        await publisher.publish([EVENT, processed])
+
+        # Assert: «создан» — в очередь новых платежей, «проведён» — в очередь уведомлений
+        assert [(p["routing_key"], p["headers"]) for p in broker.published] == [
+            ("payments.new", {"x-event-type": "payment_created"}),
+            ("payments.processed", {"x-event-type": "payment_processed"}),
+        ]
+
     async def test__empty_batch(self) -> None:
         # Setup
         broker = FakeBroker()
@@ -167,7 +182,9 @@ class TestPublish:
         with pytest.raises(payment_events.EventPublishingFailed) as excinfo:
             await publisher.publish([EVENT, OTHER])
 
-        assert f"событие {OTHER.event_id} платежа {OTHER.payment_id}" in str(excinfo.value)
+        assert f"событие {OTHER.event_id} (payment_created) платежа {OTHER.payment_id}" in str(
+            excinfo.value
+        )
 
     async def test__no_confirmation_is_success(self) -> None:
         # Setup

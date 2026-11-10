@@ -1,7 +1,8 @@
-"""Проводная модель события «платёж создан» — контракт с консьюмером очереди.
+"""Проводная модель событий платежа — контракт с консьюмерами очередей.
 
 Своя модель, а не событие ядра: формат очереди меняется независимо от ядра, как тела ответов
-HTTP (``*Response``). Время — ISO 8601 с часовым поясом.
+HTTP (``*Response``). Поля событий всех типов совпадают, различает их ``type`` (в теле и в
+заголовке). Время — ISO 8601 с часовым поясом.
 """
 
 from datetime import datetime
@@ -16,14 +17,15 @@ CONTENT_TYPE = "application/json"
 EVENT_TYPE_HEADER = "x-event-type"
 
 
-class PaymentCreatedMessage(BaseModel):
-    """Тело сообщения о созданном платеже (JSON).
+class PaymentEventMessage(BaseModel):
+    """Тело сообщения о событии платежа (JSON).
 
     Attributes:
-        event_id: Идентификатор события; он же ``message_id`` сообщения.
-        type: Тип события — ``payment_created``.
-        occurred_at: Момент создания платежа.
-        payment_id: Платёж, который нужно обработать.
+        event_id: Идентификатор события; он же ``message_id`` сообщения — ключ идемпотентности
+            у консьюмера.
+        type: Тип события: ``payment_created``, ``payment_processed``.
+        occurred_at: Момент сценария, породившего событие.
+        payment_id: Платёж, к которому относится событие.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -34,11 +36,11 @@ class PaymentCreatedMessage(BaseModel):
     payment_id: UUID
 
     @classmethod
-    def from_application(cls, event: dtos.PaymentCreated) -> "PaymentCreatedMessage":
+    def from_application(cls, event: dtos.AnyPaymentEvent) -> "PaymentEventMessage":
         """Строит сообщение из события ядра.
 
         Args:
-            event: Событие «платёж создан».
+            event: Событие платежа.
 
         Returns:
             Проводная модель события.

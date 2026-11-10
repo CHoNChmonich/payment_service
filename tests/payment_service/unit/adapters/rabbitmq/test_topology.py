@@ -2,12 +2,12 @@ from unittest.mock import AsyncMock
 
 from faststream.rabbit import ExchangeType, RabbitExchange, RabbitQueue
 
-from payment_service.adapters import new_payments
+from payment_service.adapters import rabbitmq
 
 # ---------------------------------------------------------------------------------------
 # SETUP
 # ---------------------------------------------------------------------------------------
-TOPOLOGY = new_payments.QueueTopology(
+TOPOLOGY = rabbitmq.QueueTopology(
     exchange="payments",
     queue="payments.new",
     routing_key="payments.new",
@@ -88,7 +88,7 @@ class TestDeclare:
         broker = RecordingBroker()
 
         # Call
-        await new_payments.declare(broker, TOPOLOGY)  # type: ignore[arg-type]
+        await rabbitmq.declare(broker, TOPOLOGY)  # type: ignore[arg-type]
 
         # Assert
         assert broker.log == [

@@ -7,14 +7,14 @@ from payment_service.application import dtos
 
 
 class EventPublisher(ABC):
-    """Публикация событий платежей для консьюмера (брокер сообщений)."""
+    """Публикация событий платежей в очереди обработки (брокер сообщений)."""
 
     @abstractmethod
-    async def publish(self, events: Sequence[dtos.PaymentCreated]) -> None:
+    async def publish(self, events: Sequence[dtos.AnyPaymentEvent]) -> None:
         """Публикует события и ждёт подтверждения доставки каждого.
 
         Доставка — не менее одного раза: после сбоя часть событий могла дойти, и повтор
-        опубликует их снова; консьюмер отбрасывает дубли по состоянию платежа.
+        опубликует их снова; потребители отбрасывают дубли по ``event_id``.
 
         Args:
             events: События в порядке публикации.
