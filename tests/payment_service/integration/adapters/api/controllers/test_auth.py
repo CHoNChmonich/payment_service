@@ -12,8 +12,8 @@ from fastapi.routing import APIRoute
 
 from payment_service.adapters.api import V1Controller
 from payment_service.adapters.api.v1 import create_router
+from payment_service.adapters.api.v1.controller import MAX_API_KEY_LENGTH
 from payment_service.application import errors
-from payment_service.application.dtos import MAX_API_KEY_LENGTH
 
 from .test_payments import IDEMPOTENCY_HEADERS, PAYMENT_ID, VALID_BODY, _payment_info
 

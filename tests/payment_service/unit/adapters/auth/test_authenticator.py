@@ -2,7 +2,7 @@ import pytest
 from pydantic import ValidationError
 
 from payment_service.adapters import auth
-from payment_service.application import dtos, errors
+from payment_service.application import errors
 
 # ---------------------------------------------------------------------------------------
 # SETUP
@@ -67,7 +67,7 @@ class TestSettings:
         assert api_key not in str(excinfo.value)
 
     @pytest.mark.parametrize(
-        "api_key", ["a" * (auth.MIN_API_KEY_LENGTH - 1), "b" * (dtos.MAX_API_KEY_LENGTH + 1)]
+        "api_key", ["a" * (auth.MIN_API_KEY_LENGTH - 1), "b" * (auth.MAX_API_KEY_LENGTH + 1)]
     )
     def test__length_out_of_bounds(self, api_key: str) -> None:
         # Call and Assert: ключ не попадает в текст ошибки

@@ -21,12 +21,6 @@ MAX_METADATA_BYTES = 4096  # сериализованный JSON метадан�
 # для БД, но один для человека.
 IDEMPOTENCY_KEY_PATTERN = r"^\S(.*\S)?$"
 
-# API-ключ: видимые символы ASCII без пробелов (RFC 9110 token68 и шире) — иное в заголовке HTTP
-# не выживает; длиннее предела — не ключ, а мусор. Общие границы для настроек и HTTP-адаптера:
-# ключ, который прошёл настройки, обязан проходить разбор заголовка, иначе 401 на каждый запрос.
-MAX_API_KEY_LENGTH = 4096
-API_KEY_PATTERN = r"^[\x21-\x7e]+$"
-
 # Сумма платежа: Numeric(18, 2) в хранилище, строго положительная, без NaN и бесконечностей.
 Amount = Annotated[Decimal, Field(gt=0, max_digits=18, decimal_places=2, allow_inf_nan=False)]
 Description = Annotated[str, Field(max_length=MAX_DESCRIPTION_LENGTH)]

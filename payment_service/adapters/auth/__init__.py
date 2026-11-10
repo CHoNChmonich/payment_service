@@ -5,6 +5,6 @@ root. Внешнего сервиса нет, поэтому у адаптера
 """
 
 from .authenticator import Authenticator
-from .settings import MIN_API_KEY_LENGTH, Settings
+from .settings import MAX_API_KEY_LENGTH, MIN_API_KEY_LENGTH, Settings
 
-__all__ = ["MIN_API_KEY_LENGTH", "Authenticator", "Settings"]
+__all__ = ["MAX_API_KEY_LENGTH", "MIN_API_KEY_LENGTH", "Authenticator", "Settings"]

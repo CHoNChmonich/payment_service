@@ -33,8 +33,12 @@ IdempotencyKeyHeader = Annotated[
 # Скрыт из параметров операций: требование ключа объявляет схема безопасности OpenAPI.
 ApiKeyHeader = Annotated[str | None, Header(alias="X-API-Key", include_in_schema=False)]
 
-# Синтаксис ключа — общий с настройками аутентификации (``dtos.base``): мусор до сверки не доходит.
-_API_KEY = re.compile(app_dtos.API_KEY_PATTERN)
+# Синтаксис ключа в заголовке: видимые символы ASCII без пробелов (RFC 9110 token68 и шире) — иное
+# в заголовке HTTP не выживает; длиннее предела — не ключ, а мусор, до сверки он не доходит.
+# Границы не уже, чем у настроек аутентификации (``auth.Settings``): ключ сервиса обязан проходить
+# разбор, иначе 401 на каждый запрос; согласованность держит тест шва.
+MAX_API_KEY_LENGTH = 4096
+_API_KEY = re.compile(r"^[!-~]+$")
 
 
 class Controller:
@@ -117,7 +121,7 @@ class Controller:
         """Проверяет API-ключ — первый шаг каждого защищённого обработчика.
 
         По краям срезаются только пробелы и табуляции (OWS по RFC 9110); ключ из других
-        символов, кроме видимых ASCII, или длиннее ``dtos.MAX_API_KEY_LENGTH`` до сверки не доходит.
+        символов, кроме видимых ASCII, или длиннее ``MAX_API_KEY_LENGTH`` до сверки не доходит.
         При нескольких заголовках ``X-API-Key`` FastAPI отдаёт первый.
 
         Args:
@@ -130,6 +134,6 @@ class Controller:
         if x_api_key is None:
             raise errors.CredentialsMissing()
         api_key = x_api_key.strip(" \t")
-        if not _API_KEY.fullmatch(api_key) or len(api_key) > app_dtos.MAX_API_KEY_LENGTH:
+        if not _API_KEY.fullmatch(api_key) or len(api_key) > MAX_API_KEY_LENGTH:
             raise errors.CredentialsMissing()
         await self.authenticator.authenticate(api_key)
