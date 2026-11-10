@@ -1,0 +1,13 @@
+# В контекст сборки попадает только то, что копирует Dockerfile:
+# манифесты uv, пакет, тесты и entrypoint-скрипты
+*
+!pyproject.toml
+!uv.lock
+!payment_service
+!tests
+!deployment/entrypoints
+**/__pycache__
+**/*.py[oc]
+**/.pytest_cache
+**/.mypy_cache
+**/.ruff_cache

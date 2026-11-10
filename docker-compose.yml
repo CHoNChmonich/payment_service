@@ -1,0 +1,196 @@
+# Стенд: db, rabbitmq, api (миграции → uvicorn), relay (outbox → payments.new), consumer
+# (payments.new → шлюз → webhook, отказы — в DLQ), webhook_sink (эхо-приёмник webhook).
+# Профиль tests: db_for_tests и прогон интеграционных тестов.
+# Переменные ${...} — из корневого .env (копируется из .env.example); окружение shell важнее.
+name: payment-service
+
+x-app: &app
+  build:
+    context: .
+    target: production
+  restart: unless-stopped
+  env_file: .env
+  networks:
+    - app_network
+
+services:
+  db:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -d $${POSTGRES_DB} -U $${POSTGRES_USER}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    # Публикуется на хост ради локальных uv run uvicorn / alembic
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    networks:
+      - app_network
+
+  rabbitmq:
+    image: rabbitmq:4-management-alpine
+    restart: unless-stopped
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-guest}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:-guest}
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 10s
+      retries: 20
+      start_period: 10s
+    # 5672 — AMQP для процессов с хоста и интеграционных тестов, 15672 — management UI
+    ports:
+      - "${RABBITMQ_PORT:-5672}:5672"
+      - "${RABBITMQ_MANAGEMENT_PORT:-15672}:15672"
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
+    networks:
+      - app_network
+
+  api:
+    <<: *app
+    depends_on:
+      db:
+        condition: service_healthy
+    # Внутри сети compose БД — сервис db; POSTGRES_HOST/PORT из .env относятся к запуску с хоста
+    environment:
+      POSTGRES_HOST: db
+      POSTGRES_PORT: "5432"
+    entrypoint: ["entrypoint_api.sh"]
+    ports:
+      - "${APP_PORT:-8000}:8000"
+    healthcheck:
+      # В slim-образе нет curl — проверка штатным python
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request, sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/api/v1/healthcheck', timeout=2).status == 200 else 1)",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+  # Доставка событий outbox. Миграции применяет api — relay стартует после его healthcheck.
+  # Healthcheck — возраст метки «жив» (launchers/process.py): порог 60 с больше худшего
+  # промежутка между метками; compose по нему только помечает unhealthy, не перезапускает.
+  relay:
+    <<: *app
+    depends_on:
+      api:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    environment:
+      POSTGRES_HOST: db
+      POSTGRES_PORT: "5432"
+      RABBITMQ_URL: amqp://${RABBITMQ_USER:-guest}:${RABBITMQ_PASSWORD:-guest}@rabbitmq:5672/
+      HEARTBEAT_FILE: /tmp/relay.alive
+    entrypoint: ["entrypoint_relay.sh"]
+    healthcheck:
+      test: ["CMD", "python", "-m", "payment_service.launchers.process", "--check-heartbeat", "60"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    # Остановка: текущая публикация ждёт подтверждения — payment_events.Settings.stop_grace (15 с)
+    stop_grace_period: 20s
+
+  # Консьюмер новых платежей. lock_timeout — чтобы ожидание блокировки укладывалось в дедлайн
+  # попытки (связки проверяет launchers/consumer.py при старте). stop_grace_period — не меньше
+  # new_payments.Settings.stop_grace (по умолчанию 110 с): дорабатывающий платёж подтверждается.
+  # PAYMENT_GATEWAY_FAILURE_RATE берётся из окружения shell (e2e переключает 0.1 → 1).
+  consumer:
+    <<: *app
+    depends_on:
+      api:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    environment:
+      POSTGRES_HOST: db
+      POSTGRES_PORT: "5432"
+      POSTGRES_LOCK_TIMEOUT_MS: "20000"
+      RABBITMQ_URL: amqp://${RABBITMQ_USER:-guest}:${RABBITMQ_PASSWORD:-guest}@rabbitmq:5672/
+      HEARTBEAT_FILE: /tmp/consumer.alive
+      PAYMENT_GATEWAY_FAILURE_RATE: ${PAYMENT_GATEWAY_FAILURE_RATE:-0.1}
+    entrypoint: ["entrypoint_consumer.sh"]
+    healthcheck:
+      test: ["CMD", "python", "-m", "payment_service.launchers.process", "--check-heartbeat", "60"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    stop_grace_period: 110s
+
+  # Эхо-приёмник webhook: пишет каждый запрос (заголовки и тело) JSON-строкой в лог.
+  # Адрес для webhook_url — http://webhook_sink:8080/... (внутри сети compose);
+  # порт на хосте — только чтобы посмотреть ответ в браузере.
+  webhook_sink:
+    image: mendhak/http-https-echo:37
+    restart: unless-stopped
+    environment:
+      HTTP_PORT: "8080"
+    ports:
+      - "${WEBHOOK_SINK_PORT:-8081}:8080"
+    networks:
+      - app_network
+
+  # Интеграционные тесты: отдельная БД и брокер стенда (временные очереди).
+  # docker compose --profile tests run --rm --build tests
+  tests:
+    build:
+      context: .
+      target: tests
+    profiles: ["tests"]
+    depends_on:
+      db_for_tests:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    env_file: .env
+    environment:
+      TEST_POSTGRES_HOST: db_for_tests
+      TEST_POSTGRES_PORT: "5432"
+      TEST_RABBITMQ_URL: amqp://${RABBITMQ_USER:-guest}:${RABBITMQ_PASSWORD:-guest}@rabbitmq:5672/
+    entrypoint: ["entrypoint_tests.sh"]
+    networks:
+      - app_network
+
+  db_for_tests:
+    image: postgres:17-alpine
+    profiles: ["tests"]
+    environment:
+      POSTGRES_USER: ${TEST_POSTGRES_USER}
+      POSTGRES_PASSWORD: ${TEST_POSTGRES_PASSWORD}
+      POSTGRES_DB: ${TEST_POSTGRES_DB}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -d $${POSTGRES_DB} -U $${POSTGRES_USER}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    # Публикуется на хост ради локального uv run pytest; данные не хранятся (без volume)
+    ports:
+      - "${TEST_POSTGRES_PORT:-5433}:5432"
+    networks:
+      - app_network
+
+volumes:
+  db-data:
+  rabbitmq-data:
+
+networks:
+  app_network:
+    driver: bridge
