@@ -112,6 +112,30 @@ class TestCharge:
         with pytest.raises(errors.GatewayUnavailable):
             await gateway.charge(PAYMENT)
 
+    async def test__accepted_payment_is_accepted_again_without_new_roll(
+        self, sleep: retry.Sleep, sleeps: list[float]
+    ) -> None:
+        # Setup: первый вызов принят; второго жребия нет — бросок на отказ не повторяется
+        random = FakeRandom(delay=2.0, rolls=[0.5])
+        gateway = payment_gateway.PaymentGateway(_settings(), random=random, sleep=sleep)
+        await gateway.charge(PAYMENT)
+
+        # Call: повтор для того же платежа (сбой фиксации результата у сервиса)
+        await gateway.charge(PAYMENT)
+
+        # Assert: идемпотентно — без задержки и без отказа
+        assert sleeps == [2.0]
+
+    async def test__failed_payment_is_rolled_again(self, sleep: retry.Sleep) -> None:
+        # Setup: отказ не запоминается — повтор бросает жребий заново
+        random = FakeRandom(delay=2.0, rolls=[0.05, 0.5])
+        gateway = payment_gateway.PaymentGateway(_settings(), random=random, sleep=sleep)
+        with pytest.raises(errors.GatewayUnavailable):
+            await gateway.charge(PAYMENT)
+
+        # Call: не поднимает
+        await gateway.charge(PAYMENT)
+
 
 class TestRetryingPaymentGateway:
     async def test__retries_gateway_unavailability(self, sleep: retry.Sleep) -> None:
