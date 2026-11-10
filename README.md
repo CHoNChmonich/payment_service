@@ -67,7 +67,7 @@ sequenceDiagram
     R->>DB: DELETE outbox, COMMIT
     MQ->>W: payment_created
     W->>DB: INSERT inbox (event_id), SELECT payment FOR UPDATE
-    W->>G: charge (2–5 с; до 3 попыток при отказе)
+    W->>G: charge (2–5 с, до 3 попыток при отказе)
     W->>DB: status = succeeded | failed + INSERT outbox payment_processed, COMMIT
     W->>MQ: ack
     R->>DB: SELECT outbox (тип payment_processed) FOR UPDATE SKIP LOCKED
