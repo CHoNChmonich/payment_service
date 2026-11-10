@@ -1,0 +1,164 @@
+[project]
+name = "payment-service"
+version = "0.1.0"
+description = "Сервис асинхронного процессинга платежей: outbox, RabbitMQ, retry, DLQ"
+requires-python = ">=3.12"
+dependencies = [
+    "alembic>=1.13",
+    "asyncpg>=0.29",
+    "fastapi>=0.143.0",
+    "faststream[rabbit]>=0.7.8",
+    "httpx>=0.28.1",
+    "pydantic>=2.11",
+    "pydantic-settings>=2.14.0",
+    "sqlalchemy[asyncio]>=2.0.36,<3",
+    "uvicorn[standard]>=0.45.0",
+]
+
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+# Пакет собирается в wheel на стадии builder Dockerfile (uv sync --no-editable)
+[tool.hatch.build.targets.wheel]
+packages = ["payment_service"]
+
+[dependency-groups]
+dev = [
+    "import-linter>=2.1",
+    "mypy>=2.0.0",
+    "pytest>=8.4.0",
+    "pytest-asyncio>=1.1.0",
+    "ruff>=0.15.0",
+]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+exclude = [".venv"]
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle errors
+    "F",    # pyflakes
+    "I",    # isort
+    "UP",   # pyupgrade
+    "B",    # flake8-bugbear
+    "RUF",  # ruff-specific rules
+    "ANN",  # flake8-annotations — обязательные type hints
+    "S",    # flake8-bandit — security checks
+    "D",    # pydocstyle — докстринги Google-стиля у всех классов и функций
+]
+ignore = [
+    "B008",   # FastAPI Query/Body/Path в дефолтах — стандартный паттерн
+    "RUF001", # кириллица в строках — русскоязычный проект
+    "RUF002", # кириллица в докстрингах
+    "RUF003", # кириллица в комментариях
+]
+
+[tool.ruff.lint.per-file-ignores]
+# В тестах докстринги не требуются: классы на метод, комментарии Setup/Call/Assert.
+"tests/**/*.py" = ["S101", "D"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+line-ending = "lf"
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+plugins = ["pydantic.mypy"]
+ignore_missing_imports = true
+
+[tool.pydantic-mypy]
+init_forbid_extra = true
+init_typed = true
+warn_required_dynamic_aliases = true
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+filterwarnings = [
+    "error::RuntimeWarning",
+    "error::pytest.PytestUnraisableExceptionWarning",
+]
+
+# Направление зависимостей слоёв; запуск — uv run lint-imports
+[tool.importlinter]
+root_package = "payment_service"
+include_external_packages = true
+
+[[tool.importlinter.contracts]]
+name = "Слои: launchers -> adapters -> application"
+type = "layers"
+layers = [
+    "payment_service.launchers",
+    "payment_service.adapters",
+    "payment_service.application",
+]
+
+[[tool.importlinter.contracts]]
+name = "Ядро не знает о фреймворках, хранилище и брокере"
+type = "forbidden"
+source_modules = ["payment_service.application"]
+forbidden_modules = [
+    "fastapi",
+    "starlette",
+    "sqlalchemy",
+    "asyncpg",
+    "httpx",
+    "faststream",
+    "aio_pika",
+    "aiormq",
+]
+
+# Новый адаптер дописывается в списки двух контрактов ниже — запреты не перечисляются поштучно.
+[[tool.importlinter.contracts]]
+name = "Адаптеры входа и выхода не знают друг о друге — их связывает composition root"
+type = "independence"
+modules = [
+    "payment_service.adapters.api",
+    "payment_service.adapters.auth",
+    "payment_service.adapters.database",
+    "payment_service.adapters.payment_events",
+    "payment_service.adapters.outbox_poller",
+    "payment_service.adapters.new_payments",
+    "payment_service.adapters.payment_gateway",
+    "payment_service.adapters.webhook",
+]
+
+[[tool.importlinter.contracts]]
+name = "Библиотеки адаптеров (log, rabbitmq, retry) не импортируют адаптеры и ядро"
+type = "forbidden"
+source_modules = [
+    "payment_service.adapters.log",
+    "payment_service.adapters.rabbitmq",
+    "payment_service.adapters.retry",
+]
+forbidden_modules = [
+    "payment_service.application",
+    "payment_service.adapters.api",
+    "payment_service.adapters.auth",
+    "payment_service.adapters.database",
+    "payment_service.adapters.payment_events",
+    "payment_service.adapters.outbox_poller",
+    "payment_service.adapters.new_payments",
+    "payment_service.adapters.payment_gateway",
+    "payment_service.adapters.webhook",
+]
+
+[[tool.importlinter.contracts]]
+name = "Входящие адаптеры зависят от входящих портов, а не от сервисов"
+type = "forbidden"
+source_modules = [
+    "payment_service.adapters.api",
+    "payment_service.adapters.new_payments",
+    "payment_service.adapters.outbox_poller",
+]
+forbidden_modules = ["payment_service.application.services"]
